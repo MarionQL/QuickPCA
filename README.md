@@ -1,6 +1,9 @@
-# QuickPCA
+# 💠 Welcome to the universe of eigenvectors!
 
-*A streamlined workflow for Essential Dynamics Analysis of Molecular Dynamics trajectories.*
+<img 
+    src="https://github.com/TheVisualHub/VisualFactory/blob/main/assets/quickPCA_logo.png" 
+    alt="QuickPCA Logo" 
+    width="800">
 
 QuickPCA is a lightweight Python script that performs Principal Component Analysis (PCA) on molecular dynamics trajectories in PyMOL. It automatically loads trajectory data from the curent directory and generates a publication-ready report.
 
