@@ -1,4 +1,4 @@
-# 💠 Welcome to the universe of eigenvectors!
+# 💠 QuickPCA: welcome to the universe of eigenvectors!
 
 <img 
     src="https://github.com/TheVisualHub/VisualFactory/blob/main/assets/quickPCA_logo.png" 
