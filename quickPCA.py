@@ -35,7 +35,12 @@ from pymol import cmd
 PCA_SEL    = "polymer and name CA"
 
 # Number of principal components to compute (≥2 required)
+# Mode "count" uses the PCA_NCOMP number
+# Mode "variance" uses the explained variance ratio to 
+# determine the number of PCs to compute
+PCA_MODE = "count" # "count" or "variance"
 PCA_NCOMP  = 10
+PCA_VAR = 0.90
 
 # Free-Energy Landscape histogram resolution and smoothing
 PCA_NBINS  = 50      # bins per axis
@@ -121,6 +126,11 @@ def compute_pca(obj_name, selection=PCA_SEL, n_components=PCA_NCOMP):
           f"top-{n_comp} cumulative = {cumvar[-1]*100:.1f}%")
 
     # ── Residue cross-correlation matrix ─────────────────────────────────────
+    if PCA_MODE =="variance":
+        n_cc = np.searchsorted(cumvar, PCA_VAR) + 1
+    else:
+        n_cc = min(PCA_NCOMP, n_comp)
+    print(f"Cross-correlation using {n_cc} PCs")
     n_atoms  = positions.shape[1] // 3
     evecs_3d = evecs.reshape(n_comp, n_atoms, 3)
     cov      = np.einsum('kia,kja,k->ij', evecs_3d, evecs_3d, np.abs(eigs))
