@@ -36,11 +36,10 @@ PCA_SEL    = "polymer and name CA"
 
 # Number of principal components to compute (≥2 required)
 # Mode "count" uses the PCA_NCOMP number
-# Mode "variance" uses the explained variance ratio to 
-# determine the number of PCs to compute
+# Mode "variance" uses the explained variance ratio to determine the number of PCs to compute
 PCA_MODE = "count" # "count" or "variance"
-PCA_NCOMP  = 10
-PCA_VAR = 0.90
+PCA_NCOMP  = 10 # used when PCA_MODE = "count"
+PCA_VAR = 0.90 # used when PCA_MODE = "variance"
 
 # Free-Energy Landscape histogram resolution and smoothing
 PCA_NBINS  = 50      # bins per axis
@@ -55,6 +54,10 @@ MD_INTERVAL = 5 # takes every 5 snapshots from initial data
 # Output filename
 OUTPUT_PNG = "PCA_Report.png"
 
+# Add CSV file outputs of explained variance ratio and loadings
+EXPORT_CSV = True
+OUTPUT_EVR_CSV = "PCA_explained_variance.csv"
+OUTPUT_LOADINGS_CSV = "PCA_loadings.csv"
 # =============================================================================
 # 🔬  CORE FUNCTIONS
 # =============================================================================
@@ -108,11 +111,25 @@ def compute_pca(obj_name, selection=PCA_SEL, n_components=PCA_NCOMP):
         return None
 
     positions = np.array(frames)                          # (n_frames, 3*n_atoms)
-    n_comp    = min(n_components, min(positions.shape) - 1)
+    
+    if PCA_MODE == "variance":
+        n_comp = PCA_VAR
+    else:
+        n_comp = min(PCA_NCOMP, min(positions.shape) - 1)
+        
     centered  = (positions - positions.mean(axis=0)).astype(np.float64)
 
-    print(f"   PCA: ({positions.shape[0]} frames, {positions.shape[1]} features) "
-      f"from {positions.shape[1]//3} CA-atoms → {n_comp} PCs")
+    if PCA_MODE == "variance":
+        print(
+            f"   PCA: ({positions.shape[0]} frames, {positions.shape[1]} features) "
+            f"from {positions.shape[1]//3} CA-atoms → retaining PCs until "
+            f"{PCA_VAR:.0%} cumulative variance"
+        )
+    else:
+        print(
+            f"   PCA: ({positions.shape[0]} frames, {positions.shape[1]} features) "
+            f"from {positions.shape[1]//3} CA-atoms → {n_comp} PCs"
+        )
 
     pca_model = _PCA(n_components=n_comp, svd_solver="full")
     proj      = pca_model.fit_transform(centered)         # (n_frames, n_comp)
@@ -121,16 +138,12 @@ def compute_pca(obj_name, selection=PCA_SEL, n_components=PCA_NCOMP):
     cumvar = np.cumsum(evr)
     eigs   = pca_model.explained_variance_
     evecs  = pca_model.components_                        # (n_comp, 3*n_atoms)
+    n_comp = len(evr)
 
     print(f"   PC1 = {evr[0]*100:.1f}%   PC2 = {evr[1]*100:.1f}%   "
           f"top-{n_comp} cumulative = {cumvar[-1]*100:.1f}%")
 
     # ── Residue cross-correlation matrix ─────────────────────────────────────
-    if PCA_MODE =="variance":
-        n_cc = np.searchsorted(cumvar, PCA_VAR) + 1
-    else:
-        n_cc = min(PCA_NCOMP, n_comp)
-    print(f"Cross-correlation using {n_cc} PCs")
     n_atoms  = positions.shape[1] // 3
     evecs_3d = evecs.reshape(n_comp, n_atoms, 3)
     cov      = np.einsum('kia,kja,k->ij', evecs_3d, evecs_3d, np.abs(eigs))
@@ -144,6 +157,7 @@ def compute_pca(obj_name, selection=PCA_SEL, n_components=PCA_NCOMP):
         cumulative_variance      = cumvar,
         cross_correlation        = cross_corr,
         n_components             = n_comp,
+        eigenvectors             = evecs,
     )
 
 
@@ -177,7 +191,6 @@ def compute_fel(pca_result, temperature=PCA_TEMP,
                 xedges=xe, yedges=ye,
                 pc1=pc1, pc2=pc2, kBT=kBT, temperature=temperature)
 
-
 # =============================================================================
 # 📊  REPORT FIGURE  (2 × 2 layout)
 # =============================================================================
@@ -206,6 +219,21 @@ def plot_pca_report(obj_name,
     pca = compute_pca(obj_name, selection, n_components)
     if pca is None:
         return None
+    if EXPORT_CSV:
+        evr = pca["explained_variance_ratio"]
+        cumvar = pca["cumulative_variance"]
+        n_used = pca["n_components"]
+    
+        np.savetxt(OUTPUT_EVR_CSV, np.column_stack((np.arange(1, len(evr)+1), evr, cumvar)), delimiter=",",
+                   header="PC,explained_variance_ratio,cumulative_variance",
+                   comments=""
+                  )
+        loadings = np.column_stack((np.arange(1, n_used + 1)[:,None], pca["eigenvectors"][:n_used]))
+        
+        np.savetxt(OUTPUT_LOADINGS_CSV, loadings, delimiter=",", 
+                   header="PC," + ",".join(f"feature_{i+1}" for i in range(pca["eigenvectors"].shape[1])),
+                   comments=""
+                  )
 
     fel = compute_fel(pca, temperature, n_bins, sigma)
 
