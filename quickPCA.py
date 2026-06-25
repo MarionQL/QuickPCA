@@ -1,4 +1,4 @@
-# quick_pca.py (ver 1.03)
+# quick_pca.py (ver 1.04)
 # Essential Dynamics Analysis for MD trajecotories in PyMOL.
 # Author: Gleb Novikov
 # © The Visual Hub 2026
@@ -41,7 +41,7 @@ except ImportError:
 
 # SVD performed directly on (n_frames × 3N) Cα coordinate matrix
 PCA_SEL     = "polymer and name CA"        # used inside PyMOL
-PCA_SEL_MDA = "name CA"        # used standalone, via MDAnalysis
+PCA_SEL_MDA = "name CA"        # used standalone, via MDAnalysis - added in ver 1.03
 PCA_SEL_ACTIVE = PCA_SEL if USE_PYMOL else PCA_SEL_MDA
 
 # Number of principal components to compute (≥2 required)
@@ -68,6 +68,15 @@ OUTPUT_PNG = "PCA_Report.png"
 EXPORT_CSV = True
 OUTPUT_EVR_CSV = "PCA_explained_variance.csv"
 OUTPUT_LOADINGS_CSV = "PCA_loadings.csv"
+
+# Clustering settings
+CLUSTER = True
+CLUSTER_USE_UMAP = False
+CLUSTER_KMAX = 12
+CLUSTER_INERTIA_THRESHOLD = 0.15
+CLUSTER_EXTRACT_CENTROIDS = True
+CLUSTER_OUTDIR = "clustering"
+
 # =============================================================================
 # 🔬  CORE FUNCTIONS
 # =============================================================================
@@ -219,6 +228,193 @@ def compute_fel(pca_result, temperature=PCA_TEMP,
                 pc1=pc1, pc2=pc2, kBT=kBT, temperature=temperature)
 
 # =============================================================================
+# 🔵  CLUSTERING  (added in ver 1.04)
+# =============================================================================
+ 
+# Colour palette kept consistent with the rest of the script
+_CLUSTER_PALETTE = [
+    "steelblue", "coral", "teal", "darkorange",
+    "mediumpurple", "seagreen", "crimson", "goldenrod",
+    "slategray", "deeppink",
+]
+ 
+def _kmeans_elbow(projections, label=""):
+    """
+    Fit KMeans for k = 2 … CLUSTER_KMAX, pick the largest k where the
+    relative inertia drop still meets CLUSTER_INERTIA_THRESHOLD, save an
+    elbow plot, and return labels + cluster centres for the best k.
+    """
+    from sklearn.cluster import KMeans
+    from matplotlib.lines import Line2D
+ 
+    k_values = list(range(2, CLUSTER_KMAX + 1))
+    inertias = []
+    for k in k_values:
+        km = KMeans(n_clusters=k, random_state=42, n_init="auto").fit(projections)
+        inertias.append(km.inertia_)
+ 
+    inertias_arr = np.array(inertias)
+    rel_drops    = -np.diff(inertias_arr) / inertias_arr[:-1]
+ 
+    best_k = k_values[0]
+    for i, drop in enumerate(rel_drops):
+        if drop >= CLUSTER_INERTIA_THRESHOLD:
+            best_k = k_values[i + 1]
+        else:
+            break
+ 
+    print(f"   🔵  {label} best k = {best_k}  "
+          f"(threshold {CLUSTER_INERTIA_THRESHOLD:.0%})")
+ 
+    # ── elbow plot ──────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(k_values, inertias_arr, "o-", color="steelblue",
+            lw=2, ms=6, mec="navy", mew=0.8)
+    for i in range(len(inertias_arr) - 1):
+        ax.text((k_values[i] + k_values[i+1]) / 2 + 0.1,
+                (inertias_arr[i] + inertias_arr[i+1]) / 2,
+                f"{rel_drops[i]:.1%}", fontsize=8, ha="center", va="bottom")
+    ax.axvline(best_k, color="coral", ls="--", lw=1.4, label=f"Best k = {best_k}")
+    ax.set_xlabel("Number of clusters (k)", fontsize=11, fontweight="bold")
+    ax.set_ylabel("Inertia", fontsize=11, fontweight="bold")
+    ax.set_title(f"Elbow Method — {label}", fontsize=12, fontweight="bold")
+    ax.grid(True, axis="y", color="skyblue", alpha=0.4, linestyle="--")
+    ax.set_axisbelow(True)
+    ax.legend(fontsize=9)
+    os.makedirs(CLUSTER_OUTDIR, exist_ok=True)
+    fig.savefig(os.path.join(CLUSTER_OUTDIR, f"elbow_{label}.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close(fig)
+ 
+    best_km = KMeans(n_clusters=best_k, random_state=42, n_init="auto").fit(projections)
+    return best_km.labels_, best_km.cluster_centers_
+ 
+ 
+def _plot_cluster_embedding(embedding2d, labels, centers2d, method, label):
+    """
+    2-D scatter plot of cluster assignments, matching quick_pca aesthetics.
+    *embedding2d* and *centers2d* are the first two columns of whatever
+    reduced space is being plotted (PCA or UMAP).
+    """
+    from matplotlib.lines import Line2D
+ 
+    unique_k = np.unique(labels)
+    colors   = [_CLUSTER_PALETTE[i % len(_CLUSTER_PALETTE)] for i in labels]
+ 
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.scatter(embedding2d[:, 0], embedding2d[:, 1],
+               c=colors, edgecolors="k", linewidths=0.3, s=40, alpha=0.85,
+               rasterized=True)
+ 
+    # centroid markers
+    for i, ctr in enumerate(centers2d):
+        base = np.array(plt.matplotlib.colors.to_rgb(
+            _CLUSTER_PALETTE[i % len(_CLUSTER_PALETTE)]))
+        light = base + (1 - base) * 0.45
+        ax.scatter(ctr[0], ctr[1], color=light, edgecolors="k",
+                   s=220, marker="X", linewidths=1.5, zorder=10)
+        ax.text(ctr[0], ctr[1], str(i), fontsize=9, fontweight="bold",
+                ha="center", va="center", color="white", zorder=11)
+ 
+    legend_els = [
+        Line2D([0], [0], marker="o", color="w", label=f"Cluster {i}",
+               markerfacecolor=_CLUSTER_PALETTE[i % len(_CLUSTER_PALETTE)],
+               markeredgecolor="k", markersize=8)
+        for i in unique_k
+    ]
+    ax.legend(handles=legend_els, title="Clusters", fontsize=9,
+              title_fontsize=10, loc="best", frameon=True)
+    ax.set_xlabel(f"{method} 1", fontsize=11, fontweight="bold")
+    ax.set_ylabel(f"{method} 2", fontsize=11, fontweight="bold")
+    ax.set_title(f"Cluster Assignments — {method}  ({label})",
+                 fontsize=12, fontweight="bold")
+    ax.grid(True, color="lightgray", alpha=0.5, linestyle="--")
+ 
+    os.makedirs(CLUSTER_OUTDIR, exist_ok=True)
+    fig.savefig(os.path.join(CLUSTER_OUTDIR, f"clusters_{method}_{label}.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"   📊  Cluster plot saved → "
+          f"{CLUSTER_OUTDIR}/clusters_{method}_{label}.png")
+ 
+ 
+def _extract_centroids(system, proj_frames, labels, centers, label):
+    """
+    For each cluster save the frame whose projection is closest to the
+    centroid as a PDB file.  Works with both PyMOL and MDAnalysis backends.
+ 
+    *proj_frames* — (n_frames, n_comp) projections, one row per strided frame
+    *labels*      — cluster label per frame
+    *centers*     — (k, n_comp) cluster centres
+    """
+    outdir = os.path.join(CLUSTER_OUTDIR, f"centroids_{label}")
+    os.makedirs(outdir, exist_ok=True)
+ 
+    for cid, center in enumerate(centers):
+        mask        = labels == cid
+        idx_in_clus = np.where(mask)[0]
+        dists       = np.linalg.norm(proj_frames[idx_in_clus] - center, axis=1)
+        frame_idx   = int(idx_in_clus[np.argmin(dists)])   # index into strided frames
+ 
+        out_path = os.path.join(outdir, f"cluster{cid}.pdb")
+ 
+        if USE_PYMOL:
+            # PyMOL states are 1-indexed; frame_idx is already strided
+            state = frame_idx + 1
+            tmp   = f"_centroid_tmp_{cid}"
+            cmd.create(tmp, system, source_state=state, target_state=1)
+            cmd.save(out_path, tmp)
+            cmd.delete(tmp)
+        else:
+            system.trajectory[frame_idx * MD_INTERVAL]
+            system.atoms.write(out_path)
+ 
+        print(f"   💾  Cluster {cid} centroid (frame {frame_idx}) → {out_path}")
+ 
+ 
+def run_clustering(pca_result, system):
+    """
+    Orchestrates KMeans clustering (and optionally UMAP) on the PCA projections.
+    Called automatically from plot_pca_report when CLUSTER = True.
+    """
+    if not CLUSTER:
+        return
+ 
+    proj = pca_result["projections"]   # (n_frames, n_comp)
+    os.makedirs(CLUSTER_OUTDIR, exist_ok=True)
+ 
+    methods = {"PCA": proj}
+    if CLUSTER_USE_UMAP:
+        try:
+            import umap as _umap
+            print("   🔵  Running UMAP …")
+            methods["UMAP"] = _umap.UMAP(random_state=42).fit_transform(proj)
+        except ImportError:
+            print("   ⚠️  umap-learn not found — skipping UMAP.  pip install umap-learn")
+ 
+    print(f"\n🔵  Clustering — {', '.join(methods)} …")
+    for method_name, embedding in methods.items():
+        labels, centers = _kmeans_elbow(embedding, label=method_name)
+ 
+        _plot_cluster_embedding(
+            embedding2d = embedding[:, :2],
+            labels      = labels,
+            centers2d   = centers[:, :2],
+            method      = method_name,
+            label       = method_name,
+        )
+ 
+        # save frame-level CSV
+        csv_path = os.path.join(CLUSTER_OUTDIR, f"cluster_labels_{method_name}.csv")
+        np.savetxt(csv_path,
+                   np.column_stack([np.arange(len(labels)), labels]),
+                   delimiter=",", header="frame,cluster", comments="", fmt="%d")
+        print(f"   🗂️  Labels saved → {csv_path}")
+ 
+        if CLUSTER_EXTRACT_CENTROIDS:
+            _extract_centroids(system, embedding, labels, centers, label=method_name)
+
+# =============================================================================
 # 📊  REPORT FIGURE  (2 × 2 layout)
 # =============================================================================
 
@@ -246,6 +442,9 @@ def plot_pca_report(obj_name,
     pca = compute_pca(obj_name, selection, n_components)
     if pca is None:
         return None
+    
+    if CLUSTER:
+        run_clustering(pca, obj_name)
     if EXPORT_CSV:
         evr = pca["explained_variance_ratio"]
         cumvar = pca["cumulative_variance"]
