@@ -1,4 +1,4 @@
-# quick_pca.py (ver 1.01)
+# quick_pca.py (ver 1.03)
 # Essential Dynamics Analysis for MD trajecotories in PyMOL.
 # Author: Gleb Novikov
 # © The Visual Hub 2026
@@ -25,14 +25,24 @@ import platform # added in ver 1.01
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import gaussian_filter
-from pymol import cmd
+
+
+USE_PYMOL = False
+try:
+    from pymol import cmd
+    USE_PYMOL = True
+except ImportError:
+    USE_PYMOL = False
 
 # =============================================================================
 # ⚙️  USER SETTINGS  — edit these before running
 # =============================================================================
 
+
 # SVD performed directly on (n_frames × 3N) Cα coordinate matrix
-PCA_SEL    = "polymer and name CA"
+PCA_SEL     = "polymer and name CA"        # used inside PyMOL
+PCA_SEL_MDA = "name CA"        # used standalone, via MDAnalysis
+PCA_SEL_ACTIVE = PCA_SEL if USE_PYMOL else PCA_SEL_MDA
 
 # Number of principal components to compute (≥2 required)
 # Mode "count" uses the PCA_NCOMP number
@@ -61,6 +71,15 @@ OUTPUT_LOADINGS_CSV = "PCA_loadings.csv"
 # =============================================================================
 # 🔬  CORE FUNCTIONS
 # =============================================================================
+def _n_frames(system):
+    """
+    Number of frames available for PCA.
+    PyMOL's load_traj already applied MD_INTERVAL at load time, so count_states
+    reflects the strided count directly. MDAnalysis loads every frame, so we
+    apply the same stride here ourselves to keep both backends behaving the same.
+    """
+    return cmd.count_states(system) if USE_PYMOL \
+        else len(range(0, len(system.trajectory), MD_INTERVAL))
 
 def compute_pca(obj_name, selection=PCA_SEL, n_components=PCA_NCOMP):
     """
@@ -74,20 +93,28 @@ def compute_pca(obj_name, selection=PCA_SEL, n_components=PCA_NCOMP):
     except ImportError:
         print("❌  scikit-learn not found.  pip install scikit-learn")
         return None
+    n_states = cmd.count_states(obj_name) if USE_PYMOL else _n_frames(obj_name)
 
-    n_states = cmd.count_states(obj_name)
     if n_states < 3:
         print(f"❌  Need at least 3 frames, found {n_states}.")
         return None
 
     print(f"   Extracting '{selection}' from {n_states} states …")
+    
+    # MDAnalysis: parse the selection once and reuse it every frame (much
+    # faster than re-parsing the selection string n_states times)
+    atom_group = None if USE_PYMOL else obj_name.select_atoms(selection)
 
     ref_pos = ref_com = None
     frames  = []
 
     for state in range(1, n_states + 1):
-        model  = cmd.get_model(f"({obj_name}) and ({selection})", state=state)
-        coords = np.array([a.coord for a in model.atom], dtype=np.float64)
+        if USE_PYMOL:
+            model  = cmd.get_model(f"({obj_name}) and ({selection})", state=state)
+            coords = np.array([a.coord for a in model.atom], dtype=np.float64)
+        else:
+            obj_name.trajectory[(state - 1) * MD_INTERVAL]
+            coords = atom_group.positions.astype(np.float64)
 
         if coords.size == 0:
             print(f"   ⚠️  State {state}: no atoms matched — skipping.")
@@ -196,7 +223,7 @@ def compute_fel(pca_result, temperature=PCA_TEMP,
 # =============================================================================
 
 def plot_pca_report(obj_name,
-                    selection  = PCA_SEL,
+                    selection = PCA_SEL_ACTIVE,
                     n_components = PCA_NCOMP,
                     n_bins     = PCA_NBINS,
                     sigma      = PCA_SIGMA,
@@ -371,25 +398,47 @@ def plot_pca_report(obj_name,
 def main():
     # start benchmark timer
     start_all = time.time() # start benchamrk timer
+    print(f"🔌  Backend: {'PyMOL' if USE_PYMOL else 'MDAnalysis'}")
+    
     traj = next(
         (f for ext in ("*.nc", "*.xtc", "*.trr", "*.dcd")
          for f in glob.glob(ext)),
         None
     )
 
-    all_objects = cmd.get_names("objects")
-    if not all_objects:
-        print("❌  No objects loaded in PyMOL. Load topology + trajectory first.")
-        return
+    if USE_PYMOL:
+        all_objects = cmd.get_names("objects")
+        if not all_objects:
+            print("❌  No objects loaded in PyMOL. Load topology + trajectory first.")
+            return
 
-    target = all_objects[0]
-    print(f"✨  Target object: {target}")
+        target = all_objects[0]
+        print(f"✨  Target object: {target}")
 
-    if traj:
-        print(f"💫  Loading trajectory: {traj}")
-        cmd.load_traj(traj, target, interval=MD_INTERVAL)
+        if traj:
+            print(f"💫  Loading trajectory: {traj}")
+            cmd.load_traj(traj, target, interval=MD_INTERVAL)
+        else:
+            print("ℹ️   No trajectory file found — using states already in PyMOL.")
     else:
-        print("ℹ️   No trajectory file found — using states already in PyMOL.")
+        try:
+            import MDAnalysis as mda
+        except ImportError:
+            print("❌  Neither PyMOL nor MDAnalysis is available.  pip install MDAnalysis")
+            return
+
+        top = next(iter(glob.glob("*.pdb")), None)
+        if not top:
+            print("❌  No topology (.pdb) file found in this folder.")
+            return
+        print(f"✨  Topology: {top}")
+
+        if traj:
+            print(f"💫  Loading trajectory: {traj}")
+            target = mda.Universe(top, traj)
+        else:
+            print("ℹ️   No trajectory file found — using the topology's single frame.")
+            target = mda.Universe(top)
 
     plot_pca_report(target)
 
