@@ -1,652 +1,974 @@
-# quick_pca.py (ver 1.04)
-# Essential Dynamics Analysis for MD trajecotories in PyMOL.
+# quick_pca.py (ver 2.00)
+# Essential Dynamics Analysis for MD trajectories.
+# Runs inside PyMOL (drag-and-drop) or standalone via MDAnalysis.
+# Supports PCA, TICA, and UMAP on single or multiple trajectories.
+#
 # Author: Gleb Novikov
 # © The Visual Hub 2026
-# For educational use only. 
+# For educational use only.
 # If you use QuickPCA in your research, please cite this tool.
-# Any contributions toward its development are also appreciated.
 #
 # INSTRUCTIONS:
-# 1. Place this script in the same folder as your topology (pdb) and trajectory files.
-# 2. Drag-and-drop the script into the PyMOL window — it runs automatically.
-#    Supported trajectory formats: .nc  .xtc  .trr  .dcd
+#   Inside PyMOL : drag-and-drop this script into the PyMOL window.
+#   Standalone   : python quick_pca.py [--help for all options]
+#   Supported trajectory formats: .nc  .xtc  .trr  .dcd
 #
+# OUTPUT (per method: pca / tica / umap):
+#   <prefix>_<METHOD>.png           — 4-panel report
+#   <prefix>_<METHOD>_replicates.png — ellipse plot (multi-traj only)
+#   <prefix>_<METHOD>_variance.csv  — EVR / kinetic variance / timescales
+#   <prefix>_<METHOD>_loadings.csv  — eigenvectors (PCA / TICA only)
+#   clustering/<method>/            — elbow plots, scatter, centroid PDBs
 #
-# Output: PCA_Report.png  (Free-Energy Landscape + explained-variance chart
-#                          + cross-correlation matrix + PC1/PC2 projections)
-#
-# Dependencies: numpy, scikit-learn, scipy, matplotlib
+# DEPENDENCIES:
 #   pip install numpy scikit-learn scipy matplotlib
-
+#   pip install MDAnalysis              # standalone backend
+#   pip install deeptime                # for TICA
+#   pip install umap-learn              # for UMAP
+ 
+import argparse
 import glob
 import os
+import sys
 import time
-import platform # added in ver 1.01
+import platform
+ 
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.lines import Line2D
+from matplotlib.patches import Ellipse
+from matplotlib.gridspec import GridSpec
 import numpy as np
 from scipy.ndimage import gaussian_filter
-
-
+from scipy.stats import gaussian_kde
+ 
+# ── PyMOL backend detection ───────────────────────────────────────────────────
 USE_PYMOL = False
 try:
     from pymol import cmd
     USE_PYMOL = True
 except ImportError:
-    USE_PYMOL = False
-
+    pass
+ 
 # =============================================================================
-# ⚙️  USER SETTINGS  — edit these before running
-# =============================================================================
-
-
-# SVD performed directly on (n_frames × 3N) Cα coordinate matrix
-PCA_SEL     = "polymer and name CA"        # used inside PyMOL
-PCA_SEL_MDA = "name CA"        # used standalone, via MDAnalysis - added in ver 1.03
-PCA_SEL_ACTIVE = PCA_SEL if USE_PYMOL else PCA_SEL_MDA
-
-# Number of principal components to compute (≥2 required)
-# Mode "count" uses the PCA_NCOMP number
-# Mode "variance" uses the explained variance ratio to determine the number of PCs to compute
-PCA_MODE = "count" # "count" or "variance"
-PCA_NCOMP  = 10 # used when PCA_MODE = "count"
-PCA_VAR = 0.90 # used when PCA_MODE = "variance"
-
-# Free-Energy Landscape histogram resolution and smoothing
-PCA_NBINS  = 50      # bins per axis
-PCA_SIGMA  = 1.0     # Gaussian σ in bin units
-
-# Temperature (Kelvin) for Boltzmann inversion
-PCA_TEMP   = 300.0
-
-# Input trajectory options
-MD_INTERVAL = 5 # takes every 5 snapshots from initial data
-
-# Output filename
-OUTPUT_PNG = "PCA_Report.png"
-
-# Add CSV file outputs of explained variance ratio and loadings
-EXPORT_CSV = True
-OUTPUT_EVR_CSV = "PCA_explained_variance.csv"
-OUTPUT_LOADINGS_CSV = "PCA_loadings.csv"
-
-# Clustering settings
-CLUSTER = True
-CLUSTER_USE_UMAP = False
-CLUSTER_KMAX = 12
-CLUSTER_INERTIA_THRESHOLD = 0.15
-CLUSTER_EXTRACT_CENTROIDS = True
-CLUSTER_OUTDIR = "clustering"
-
-# =============================================================================
-# 🔬  CORE FUNCTIONS
-# =============================================================================
-def _n_frames(system):
-    """
-    Number of frames available for PCA.
-    PyMOL's load_traj already applied MD_INTERVAL at load time, so count_states
-    reflects the strided count directly. MDAnalysis loads every frame, so we
-    apply the same stride here ourselves to keep both backends behaving the same.
-    """
-    return cmd.count_states(system) if USE_PYMOL \
-        else len(range(0, len(system.trajectory), MD_INTERVAL))
-
-def compute_pca(obj_name, selection=PCA_SEL, n_components=PCA_NCOMP):
-    """
-    Extract Cα coordinates from every PyMOL state, Kabsch-align each frame to
-    the first, mean-centre, and run sklearn PCA.
-
-    Returns a result dict (or None on failure).
-    """
-    try:
-        from sklearn.decomposition import PCA as _PCA
-    except ImportError:
-        print("❌  scikit-learn not found.  pip install scikit-learn")
-        return None
-    n_states = cmd.count_states(obj_name) if USE_PYMOL else _n_frames(obj_name)
-
-    if n_states < 3:
-        print(f"❌  Need at least 3 frames, found {n_states}.")
-        return None
-
-    print(f"   Extracting '{selection}' from {n_states} states …")
-    
-    # MDAnalysis: parse the selection once and reuse it every frame (much
-    # faster than re-parsing the selection string n_states times)
-    atom_group = None if USE_PYMOL else obj_name.select_atoms(selection)
-
-    ref_pos = ref_com = None
-    frames  = []
-
-    for state in range(1, n_states + 1):
-        if USE_PYMOL:
-            model  = cmd.get_model(f"({obj_name}) and ({selection})", state=state)
-            coords = np.array([a.coord for a in model.atom], dtype=np.float64)
-        else:
-            obj_name.trajectory[(state - 1) * MD_INTERVAL]
-            coords = atom_group.positions.astype(np.float64)
-
-        if coords.size == 0:
-            print(f"   ⚠️  State {state}: no atoms matched — skipping.")
-            continue
-
-        # ── Kabsch alignment to frame 1 ──────────────────────────────────────
-        if ref_pos is None:
-            ref_pos = coords.copy()
-            ref_com = ref_pos.mean(axis=0)
-
-        H        = (coords - coords.mean(0)).T @ (ref_pos - ref_com)
-        U, _, Vt = np.linalg.svd(H)
-        d        = np.sign(np.linalg.det(Vt.T @ U.T))
-        R        = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
-        coords   = (coords - coords.mean(0)) @ R.T + ref_com
-
-        frames.append(coords.ravel())
-
-    if len(frames) < 3:
-        print("❌  Not enough valid frames for PCA.")
-        return None
-
-    positions = np.array(frames)                          # (n_frames, 3*n_atoms)
-    
-    if PCA_MODE == "variance":
-        n_comp = PCA_VAR
-    else:
-        n_comp = min(PCA_NCOMP, min(positions.shape) - 1)
-        
-    centered  = (positions - positions.mean(axis=0)).astype(np.float64)
-
-    if PCA_MODE == "variance":
-        print(
-            f"   PCA: ({positions.shape[0]} frames, {positions.shape[1]} features) "
-            f"from {positions.shape[1]//3} CA-atoms → retaining PCs until "
-            f"{PCA_VAR:.0%} cumulative variance"
-        )
-    else:
-        print(
-            f"   PCA: ({positions.shape[0]} frames, {positions.shape[1]} features) "
-            f"from {positions.shape[1]//3} CA-atoms → {n_comp} PCs"
-        )
-
-    pca_model = _PCA(n_components=n_comp, svd_solver="full")
-    proj      = pca_model.fit_transform(centered)         # (n_frames, n_comp)
-
-    evr    = pca_model.explained_variance_ratio_
-    cumvar = np.cumsum(evr)
-    eigs   = pca_model.explained_variance_
-    evecs  = pca_model.components_                        # (n_comp, 3*n_atoms)
-    n_comp = len(evr)
-
-    print(f"   PC1 = {evr[0]*100:.1f}%   PC2 = {evr[1]*100:.1f}%   "
-          f"top-{n_comp} cumulative = {cumvar[-1]*100:.1f}%")
-
-    # ── Residue cross-correlation matrix ─────────────────────────────────────
-    n_atoms  = positions.shape[1] // 3
-    evecs_3d = evecs.reshape(n_comp, n_atoms, 3)
-    cov      = np.einsum('kia,kja,k->ij', evecs_3d, evecs_3d, np.abs(eigs))
-    var      = np.diag(cov)
-    denom    = np.sqrt(np.outer(var, var))
-    cross_corr = np.where(denom > 0, cov / denom, 0.0).astype(np.float32)
-
-    return dict(
-        projections              = proj,
-        explained_variance_ratio = evr,
-        cumulative_variance      = cumvar,
-        cross_correlation        = cross_corr,
-        n_components             = n_comp,
-        eigenvectors             = evecs,
-    )
-
-
-def compute_fel(pca_result, temperature=PCA_TEMP,
-                n_bins=PCA_NBINS, sigma=PCA_SIGMA):
-    """
-    Boltzmann inversion of the PC1/PC2 density histogram to obtain a
-    2-D Free-Energy Landscape.  F = –kBT ln(ρ),  shifted so min(F) = 0.
-    """
-    kBT  = 0.008314462 * temperature          # kJ mol⁻¹
-    proj = pca_result["projections"]
-    pc1, pc2 = proj[:, 0], proj[:, 1]
-
-    pad_x = (pc1.max() - pc1.min()) * 0.20
-    pad_y = (pc2.max() - pc2.min()) * 0.20
-    rng   = [[pc1.min() - pad_x, pc1.max() + pad_x],
-             [pc2.min() - pad_y, pc2.max() + pad_y]]
-
-    hist, xe, ye = np.histogram2d(pc1, pc2, bins=n_bins,
-                                  range=rng, density=True)
-    hist_s = gaussian_filter(hist, sigma=sigma)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        F = np.where(hist_s > 0, -kBT * np.log(hist_s), np.nan)
-    F -= np.nanmin(F)
-
-    xc = 0.5 * (xe[:-1] + xe[1:])
-    yc = 0.5 * (ye[:-1] + ye[1:])
-
-    return dict(F=F, xcenters=xc, ycenters=yc,
-                xedges=xe, yedges=ye,
-                pc1=pc1, pc2=pc2, kBT=kBT, temperature=temperature)
-
-# =============================================================================
-# 🔵  CLUSTERING  (added in ver 1.04)
+# ⚙️  USER SETTINGS  — overridden by CLI flags when run standalone
 # =============================================================================
  
-# Colour palette kept consistent with the rest of the script
-_CLUSTER_PALETTE = [
+# Atom selection
+PCA_SEL        = "polymer and name CA"   # PyMOL syntax
+PCA_SEL_MDA    = "name CA"              # MDAnalysis syntax
+PCA_SEL_ACTIVE = PCA_SEL if USE_PYMOL else PCA_SEL_MDA
+ 
+# Dimensionality reduction
+METHODS   = ["pca"]       # any subset of: "pca", "tica", "umap"
+PCA_MODE  = "count"       # "count" → use PCA_NCOMP  |  "variance" → use PCA_VAR
+PCA_NCOMP = 10            # components to compute (count mode)
+PCA_VAR   = 0.90          # cumulative variance threshold (variance mode)
+TICA_LAG  = 10            # TICA lag time in strided frames
+ 
+# Free-Energy Landscape
+PCA_NBINS = 50            # histogram bins per axis
+PCA_SIGMA = 1.0           # Gaussian smoothing σ (bins)
+PCA_TEMP  = 300.0         # temperature (K)
+ 
+# Trajectory sampling
+MD_INTERVAL = 5           # use every Nth frame
+ 
+# Output
+OUTPUT_PREFIX = "PCA_Report"   # method suffix added automatically
+EXPORT_CSV    = True
+ 
+# Clustering
+CLUSTER                   = True
+CLUSTER_USE_UMAP          = False   # extra UMAP embedding inside clustering
+CLUSTER_KMAX              = 12
+CLUSTER_INERTIA_THRESHOLD = 0.15
+CLUSTER_EXTRACT_CENTROIDS = True
+CLUSTER_OUTDIR            = "clustering"
+ 
+# Multi-trajectory (MDAnalysis only)
+MULTI_TRAJ         = False
+MULTI_TRAJ_PATTERN = "rep*.nc"      # glob to find replicate trajectories
+REPLICATE_PLOT     = True
+REPLICATE_ELLIPSE_LEVEL = 0.95      # confidence level for ellipses
+ 
+# =============================================================================
+# 🎨  PALETTE  (shared across all plots)
+# =============================================================================
+ 
+_PALETTE = [
     "steelblue", "coral", "teal", "darkorange",
     "mediumpurple", "seagreen", "crimson", "goldenrod",
     "slategray", "deeppink",
 ]
  
-def _kmeans_elbow(projections, label=""):
+# =============================================================================
+# 🔌  BACKEND HELPERS
+# =============================================================================
+ 
+def _kabsch(mobile, ref_pos, ref_com):
+    """Pure-numpy Kabsch alignment. Used as PyMOL backend and fallback."""
+    H        = (mobile - mobile.mean(0)).T @ (ref_pos - ref_com)
+    U, _, Vt = np.linalg.svd(H)
+    d        = np.sign(np.linalg.det(Vt.T @ U.T))
+    R        = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    return (mobile - mobile.mean(0)) @ R.T + ref_com
+ 
+# Use MDAnalysis C-level rotation_matrix when available (faster than numpy SVD)
+try:
+    from MDAnalysis.analysis.align import rotation_matrix as _mda_rotmat
+    def _align(mobile, ref_pos, ref_com):
+        R, _ = _mda_rotmat(mobile - mobile.mean(0), ref_pos - ref_com)
+        return (mobile - mobile.mean(0)) @ R.T + ref_com
+except ImportError:
+    _align = _kabsch
+ 
+ 
+def _extract_frames_pymol(obj_name, selection):
+    """Extract Kabsch-aligned Cα frames from all PyMOL states."""
+    n_states = cmd.count_states(obj_name)
+    ref_pos = ref_com = None
+    frames = []
+    for state in range(1, n_states + 1):
+        model  = cmd.get_model(f"({obj_name}) and ({selection})", state=state)
+        coords = np.array([a.coord for a in model.atom], dtype=np.float64)
+        if coords.size == 0:
+            print(f"   ⚠️  State {state}: no atoms matched — skipping.")
+            continue
+        if ref_pos is None:
+            ref_pos = coords.copy(); ref_com = ref_pos.mean(0)
+        frames.append(_kabsch(coords, ref_pos, ref_com).ravel())
+    return np.array(frames, dtype=np.float64), None   # None → no replicate ids
+ 
+ 
+def _extract_frames_mda(universes, selection):
     """
-    Fit KMeans for k = 2 … CLUSTER_KMAX, pick the largest k where the
-    relative inertia drop still meets CLUSTER_INERTIA_THRESHOLD, save an
-    elbow plot, and return labels + cluster centres for the best k.
+    Extract alignment-corrected frames from one or more MDAnalysis Universes.
+    Pre-allocates output array and uses the C-level _align() for speed.
+    Returns (positions: n_frames × 3N, replicate_ids or None).
     """
+    if not isinstance(universes, (list, tuple)):
+        universes = [universes]
+ 
+    # First pass: count total strided frames per replicate
+    n_per_rep = [len(range(0, len(u.trajectory), MD_INTERVAL)) for u in universes]
+    n_total   = sum(n_per_rep)
+ 
+    # Probe n_atoms from first universe / selection
+    ag0    = universes[0].select_atoms(selection)
+    n_at   = len(ag0)
+    if n_at == 0:
+        raise ValueError(f"Selection '{selection}' matched 0 atoms.")
+ 
+    out     = np.empty((n_total, n_at * 3), dtype=np.float64)
+    rep_arr = np.empty(n_total, dtype=np.int32)
+    ref_pos = ref_com = None
+    row = 0
+ 
+    for rep_idx, u in enumerate(universes, start=1):
+        ag = u.select_atoms(selection)
+        if len(ag) != n_at:
+            raise ValueError(f"Rep {rep_idx}: atom count mismatch "
+                             f"({len(ag)} vs {n_at}).")
+        strides = range(0, len(u.trajectory), MD_INTERVAL)
+        for ts_idx in strides:
+            u.trajectory[ts_idx]
+            coords = ag.positions.astype(np.float64)
+            if ref_pos is None:
+                ref_pos = coords.copy(); ref_com = ref_pos.mean(0)
+            out[row]     = _align(coords, ref_pos, ref_com).ravel()
+            rep_arr[row] = rep_idx
+            row += 1
+        print(f"   Rep {rep_idx} ({os.path.basename(str(u.filename))}): "
+              f"{n_per_rep[rep_idx-1]} frames after stride {MD_INTERVAL}")
+ 
+    rep_ids = rep_arr if len(universes) > 1 else None
+    return out, rep_ids
+ 
+ 
+def _extract_frames(system_or_list, selection):
+    """Dispatch frame extraction to the correct backend."""
+    if USE_PYMOL:
+        return _extract_frames_pymol(system_or_list, selection)
+    return _extract_frames_mda(system_or_list, selection)
+ 
+# =============================================================================
+# 🔬  DIMENSIONALITY REDUCTION
+# =============================================================================
+ 
+def _cross_corr(evecs, weights, n_atoms):
+    """Residue cross-correlation matrix from eigenvectors + eigenvalue weights."""
+    evecs_3d   = evecs.reshape(len(evecs), n_atoms, 3)
+    cov        = np.einsum('kia,kja,k->ij', evecs_3d, evecs_3d, np.abs(weights))
+    var        = np.diag(cov)
+    denom      = np.sqrt(np.outer(var, var))
+    return np.where(denom > 0, cov / denom, 0.0).astype(np.float32)
+ 
+ 
+def reduce_pca(positions, n_components=PCA_NCOMP):
+    """
+    PCA on the (n_frames × 3N) Cα coordinate matrix.
+    Uses randomized SVD for count mode (15-17× faster); full SVD for variance mode.
+    """
+    from sklearn.decomposition import PCA as _PCA
+ 
+    if PCA_MODE == "variance":
+        n_comp, solver = PCA_VAR, "full"
+    else:
+        n_comp = min(n_components, min(positions.shape) - 1)
+        solver = "randomized"
+ 
+    centered = positions - positions.mean(0)
+    model    = _PCA(n_components=n_comp, svd_solver=solver, random_state=42)
+    proj     = model.fit_transform(centered)
+ 
+    nc     = proj.shape[1]
+    evr    = model.explained_variance_ratio_
+    cumvar = np.cumsum(evr)
+    cc     = _cross_corr(model.components_, model.explained_variance_, positions.shape[1] // 3)
+ 
+    print(f"   PC1={evr[0]*100:.1f}%  PC2={evr[1]*100:.1f}%  "
+          f"top-{nc} cumul={cumvar[-1]*100:.1f}%")
+ 
+    return dict(projections=proj, explained_variance_ratio=evr,
+                cumulative_variance=cumvar, cross_correlation=cc,
+                n_components=nc, eigenvectors=model.components_,
+                bar_label="Explained Variance (%)", comp_label="PC")
+ 
+ 
+def reduce_tica(frame_arrays, lag=None, n_components=PCA_NCOMP):
+    """
+    TICA via deeptime. *frame_arrays* is a list of (n_frames, n_features) arrays
+    — one per trajectory — so TICA respects trajectory boundaries.
+    """
+    try:
+        from deeptime.decomposition import TICA as _TICA
+    except ImportError:
+        print("❌  deeptime not found.  pip install deeptime")
+        return None
+ 
+    lag    = lag or TICA_LAG
+    stacked = np.vstack(frame_arrays)
+    n_feat  = stacked.shape[1]
+ 
+    if PCA_MODE == "variance":
+        # Fit with all components first, then trim to variance threshold
+        n_init  = min(50, n_feat - 1)
+        model   = _TICA(lagtime=lag, dim=n_init).fit(frame_arrays).fetch_model()
+        sv2     = model.singular_values[:n_init] ** 2
+        cumkv   = np.cumsum(sv2 / sv2.sum())
+        n_comp  = int(np.searchsorted(cumkv, PCA_VAR) + 1)
+        print(f"   TICA variance mode → {n_comp} ICs for {PCA_VAR:.0%} kinetic variance")
+    else:
+        n_comp = min(n_components, n_feat - 1)
+ 
+    model  = _TICA(lagtime=lag, dim=n_comp).fit(frame_arrays).fetch_model()
+    proj   = model.transform(stacked)
+ 
+    # Kinetic variance fractions (VAMP-2 analog of EVR)
+    sv2    = model.singular_values[:n_comp] ** 2
+    evr    = sv2 / sv2.sum()
+    cumvar = np.cumsum(evr)
+ 
+    # Right singular vectors: shape (n_features, n_comp) → transpose to (n_comp, n_features)
+    evecs  = model.singular_vectors_right[:, :n_comp].T
+    cc     = _cross_corr(evecs, sv2, n_feat // 3)
+    ts     = model.timescales(lagtime=lag)[:n_comp]
+ 
+    print(f"   IC1={evr[0]*100:.1f}%  IC2={evr[1]*100:.1f}%  "
+          f"top-{n_comp} cumul={cumvar[-1]*100:.1f}%")
+    print(f"   Implied timescales (frames): {np.round(ts[:5], 1)}")
+ 
+    return dict(projections=proj, explained_variance_ratio=evr,
+                cumulative_variance=cumvar, cross_correlation=cc,
+                n_components=n_comp, eigenvectors=evecs,
+                timescales=ts, lag=lag,
+                bar_label="Kinetic Variance (%)", comp_label="IC")
+ 
+ 
+def reduce_umap(projections, n_components=2):
+    """UMAP applied to existing projections (PCA or TICA output). No eigenvectors."""
+    try:
+        import umap as _umap
+    except ImportError:
+        print("❌  umap-learn not found.  pip install umap-learn")
+        return None
+    print("   Running UMAP …")
+    emb = _umap.UMAP(n_components=n_components, random_state=42).fit_transform(projections)
+    return dict(projections=emb, n_components=n_components,
+                bar_label=None, comp_label="Dim")
+ 
+ 
+def _reduce(method, positions, frame_arrays):
+    """Dispatch to the correct reduction function and return a standardised result dict."""
+    if method == "pca":
+        return reduce_pca(positions)
+    if method == "tica":
+        return reduce_tica(frame_arrays)
+    if method == "umap":
+        # UMAP runs on top of PCA projections
+        pca_r = reduce_pca(positions)
+        r = reduce_umap(pca_r["projections"]) if pca_r else None
+        return r
+    print(f"❌  Unknown method: {method}")
+    return None
+ 
+# =============================================================================
+# 🌊  FREE-ENERGY LANDSCAPE
+# =============================================================================
+ 
+def compute_fel(result, temperature=PCA_TEMP, n_bins=PCA_NBINS, sigma=PCA_SIGMA):
+    """Boltzmann inversion of PC1/PC2 (or IC1/IC2, Dim1/Dim2) density."""
+    kBT  = 0.008314462 * temperature
+    proj = result["projections"]
+    x, y = proj[:, 0], proj[:, 1]
+ 
+    pad_x = (x.max() - x.min()) * 0.20
+    pad_y = (y.max() - y.min()) * 0.20
+    rng   = [[x.min() - pad_x, x.max() + pad_x],
+             [y.min() - pad_y, y.max() + pad_y]]
+ 
+    hist, xe, ye = np.histogram2d(x, y, bins=n_bins, range=rng, density=True)
+    hist_s = gaussian_filter(hist, sigma=sigma)
+ 
+    with np.errstate(divide="ignore", invalid="ignore"):
+        F = np.where(hist_s > 0, -kBT * np.log(hist_s), np.nan)
+    F -= np.nanmin(F)
+ 
+    return dict(F=F,
+                xcenters=0.5*(xe[:-1]+xe[1:]), ycenters=0.5*(ye[:-1]+ye[1:]),
+                xedges=xe, yedges=ye, x=x, y=y, kBT=kBT)
+ 
+# =============================================================================
+# 🔵  CLUSTERING
+# =============================================================================
+ 
+def _kmeans_elbow(projections, method_label):
+    """KMeans elbow, saves plot, returns (labels, centres)."""
     from sklearn.cluster import KMeans
-    from matplotlib.lines import Line2D
  
-    k_values = list(range(2, CLUSTER_KMAX + 1))
-    inertias = []
-    for k in k_values:
-        km = KMeans(n_clusters=k, random_state=42, n_init="auto").fit(projections)
-        inertias.append(km.inertia_)
+    ks       = list(range(2, CLUSTER_KMAX + 1))
+    inertias = np.array([
+        KMeans(n_clusters=k, random_state=42, n_init="auto").fit(projections).inertia_
+        for k in ks])
+    drops = -np.diff(inertias) / inertias[:-1]
  
-    inertias_arr = np.array(inertias)
-    rel_drops    = -np.diff(inertias_arr) / inertias_arr[:-1]
- 
-    best_k = k_values[0]
-    for i, drop in enumerate(rel_drops):
-        if drop >= CLUSTER_INERTIA_THRESHOLD:
-            best_k = k_values[i + 1]
+    best_k = ks[0]
+    for i, d in enumerate(drops):
+        if d >= CLUSTER_INERTIA_THRESHOLD:
+            best_k = ks[i + 1]
         else:
             break
- 
-    print(f"   🔵  {label} best k = {best_k}  "
+    print(f"   🔵  {method_label} best k={best_k}  "
           f"(threshold {CLUSTER_INERTIA_THRESHOLD:.0%})")
  
-    # ── elbow plot ──────────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.plot(k_values, inertias_arr, "o-", color="steelblue",
-            lw=2, ms=6, mec="navy", mew=0.8)
-    for i in range(len(inertias_arr) - 1):
-        ax.text((k_values[i] + k_values[i+1]) / 2 + 0.1,
-                (inertias_arr[i] + inertias_arr[i+1]) / 2,
-                f"{rel_drops[i]:.1%}", fontsize=8, ha="center", va="bottom")
-    ax.axvline(best_k, color="coral", ls="--", lw=1.4, label=f"Best k = {best_k}")
-    ax.set_xlabel("Number of clusters (k)", fontsize=11, fontweight="bold")
+    ax.plot(ks, inertias, "o-", color="steelblue", lw=2, ms=6, mec="navy", mew=0.8)
+    for i in range(len(inertias) - 1):
+        ax.text((ks[i]+ks[i+1])/2+0.1, (inertias[i]+inertias[i+1])/2,
+                f"{drops[i]:.1%}", fontsize=8, ha="center", va="bottom")
+    ax.axvline(best_k, color="coral", ls="--", lw=1.4, label=f"Best k={best_k}")
+    ax.set_xlabel("k", fontsize=11, fontweight="bold")
     ax.set_ylabel("Inertia", fontsize=11, fontweight="bold")
-    ax.set_title(f"Elbow Method — {label}", fontsize=12, fontweight="bold")
-    ax.grid(True, axis="y", color="skyblue", alpha=0.4, linestyle="--")
-    ax.set_axisbelow(True)
+    ax.set_title(f"Elbow — {method_label}", fontsize=12, fontweight="bold")
+    ax.grid(True, axis="y", color="skyblue", alpha=0.4, ls="--"); ax.set_axisbelow(True)
     ax.legend(fontsize=9)
     os.makedirs(CLUSTER_OUTDIR, exist_ok=True)
-    fig.savefig(os.path.join(CLUSTER_OUTDIR, f"elbow_{label}.png"),
+    fig.savefig(os.path.join(CLUSTER_OUTDIR, f"elbow_{method_label}.png"),
                 dpi=300, bbox_inches="tight")
     plt.close(fig)
  
-    best_km = KMeans(n_clusters=best_k, random_state=42, n_init="auto").fit(projections)
-    return best_km.labels_, best_km.cluster_centers_
+    km = KMeans(n_clusters=best_k, random_state=42, n_init="auto").fit(projections)
+    return km.labels_, km.cluster_centers_
  
  
-def _plot_cluster_embedding(embedding2d, labels, centers2d, method, label):
-    """
-    2-D scatter plot of cluster assignments, matching quick_pca aesthetics.
-    *embedding2d* and *centers2d* are the first two columns of whatever
-    reduced space is being plotted (PCA or UMAP).
-    """
-    from matplotlib.lines import Line2D
- 
+def _plot_cluster_embedding(emb2d, labels, centers2d, title, fname):
+    """2-D scatter coloured by cluster. Matches report aesthetics."""
     unique_k = np.unique(labels)
-    colors   = [_CLUSTER_PALETTE[i % len(_CLUSTER_PALETTE)] for i in labels]
- 
-    fig, ax = plt.subplots(figsize=(8, 7))
-    ax.scatter(embedding2d[:, 0], embedding2d[:, 1],
-               c=colors, edgecolors="k", linewidths=0.3, s=40, alpha=0.85,
-               rasterized=True)
- 
-    # centroid markers
+    fig, ax  = plt.subplots(figsize=(8, 7))
+    ax.scatter(emb2d[:, 0], emb2d[:, 1],
+               c=[_PALETTE[i % len(_PALETTE)] for i in labels],
+               edgecolors="k", linewidths=0.3, s=40, alpha=0.85, rasterized=True)
     for i, ctr in enumerate(centers2d):
-        base = np.array(plt.matplotlib.colors.to_rgb(
-            _CLUSTER_PALETTE[i % len(_CLUSTER_PALETTE)]))
+        base  = np.array(mcolors.to_rgb(_PALETTE[i % len(_PALETTE)]))
         light = base + (1 - base) * 0.45
         ax.scatter(ctr[0], ctr[1], color=light, edgecolors="k",
-                   s=220, marker="X", linewidths=1.5, zorder=10)
+                   s=220, marker="X", lw=1.5, zorder=10)
         ax.text(ctr[0], ctr[1], str(i), fontsize=9, fontweight="bold",
                 ha="center", va="center", color="white", zorder=11)
- 
-    legend_els = [
-        Line2D([0], [0], marker="o", color="w", label=f"Cluster {i}",
-               markerfacecolor=_CLUSTER_PALETTE[i % len(_CLUSTER_PALETTE)],
-               markeredgecolor="k", markersize=8)
-        for i in unique_k
-    ]
-    ax.legend(handles=legend_els, title="Clusters", fontsize=9,
-              title_fontsize=10, loc="best", frameon=True)
-    ax.set_xlabel(f"{method} 1", fontsize=11, fontweight="bold")
-    ax.set_ylabel(f"{method} 2", fontsize=11, fontweight="bold")
-    ax.set_title(f"Cluster Assignments — {method}  ({label})",
-                 fontsize=12, fontweight="bold")
-    ax.grid(True, color="lightgray", alpha=0.5, linestyle="--")
- 
+    ax.legend(handles=[
+        Line2D([0],[0], marker="o", color="w", label=f"Cluster {i}",
+               markerfacecolor=_PALETTE[i%len(_PALETTE)], markeredgecolor="k", ms=8)
+        for i in unique_k], title="Clusters", fontsize=9, title_fontsize=10)
+    ax.set_xlabel("Dim 1", fontsize=11, fontweight="bold")
+    ax.set_ylabel("Dim 2", fontsize=11, fontweight="bold")
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.grid(True, color="lightgray", alpha=0.5, ls="--")
     os.makedirs(CLUSTER_OUTDIR, exist_ok=True)
-    fig.savefig(os.path.join(CLUSTER_OUTDIR, f"clusters_{method}_{label}.png"),
-                dpi=300, bbox_inches="tight")
+    fig.savefig(os.path.join(CLUSTER_OUTDIR, fname), dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"   📊  Cluster plot saved → "
-          f"{CLUSTER_OUTDIR}/clusters_{method}_{label}.png")
+    print(f"   📊  {fname}")
  
  
-def _extract_centroids(system, proj_frames, labels, centers, label):
-    """
-    For each cluster save the frame whose projection is closest to the
-    centroid as a PDB file.  Works with both PyMOL and MDAnalysis backends.
- 
-    *proj_frames* — (n_frames, n_comp) projections, one row per strided frame
-    *labels*      — cluster label per frame
-    *centers*     — (k, n_comp) cluster centres
-    """
+def _extract_centroids(systems, embedding, labels, centers, rep_ids, label):
+    """Save centroid PDB for each cluster. Handles single and multi-traj."""
+    if not isinstance(systems, (list, tuple)):
+        systems = [systems]
     outdir = os.path.join(CLUSTER_OUTDIR, f"centroids_{label}")
     os.makedirs(outdir, exist_ok=True)
  
     for cid, center in enumerate(centers):
-        mask        = labels == cid
-        idx_in_clus = np.where(mask)[0]
-        dists       = np.linalg.norm(proj_frames[idx_in_clus] - center, axis=1)
-        frame_idx   = int(idx_in_clus[np.argmin(dists)])   # index into strided frames
- 
-        out_path = os.path.join(outdir, f"cluster{cid}.pdb")
+        idx = np.where(labels == cid)[0]
+        frame_idx = int(idx[np.argmin(np.linalg.norm(embedding[idx] - center, axis=1))])
+        out_path  = os.path.join(outdir, f"cluster{cid}.pdb")
  
         if USE_PYMOL:
-            # PyMOL states are 1-indexed; frame_idx is already strided
-            state = frame_idx + 1
-            tmp   = f"_centroid_tmp_{cid}"
-            cmd.create(tmp, system, source_state=state, target_state=1)
-            cmd.save(out_path, tmp)
-            cmd.delete(tmp)
+            tmp = f"_ctmp_{cid}"
+            cmd.create(tmp, systems[0], source_state=frame_idx+1, target_state=1)
+            cmd.save(out_path, tmp); cmd.delete(tmp)
         else:
-            system.trajectory[frame_idx * MD_INTERVAL]
-            system.atoms.write(out_path)
- 
+            if rep_ids is not None:
+                rep     = rep_ids[frame_idx]
+                u       = systems[rep - 1]
+                # frame_idx is global; compute local index within this replicate
+                local   = int(np.where(rep_ids == rep)[0].tolist().index(frame_idx))
+                u.trajectory[local * MD_INTERVAL]
+            else:
+                systems[0].trajectory[frame_idx * MD_INTERVAL]
+                u = systems[0]
+            u.atoms.write(out_path)
         print(f"   💾  Cluster {cid} centroid (frame {frame_idx}) → {out_path}")
  
  
-def run_clustering(pca_result, system):
+def run_clustering(result, systems, method_label):
     """
-    Orchestrates KMeans clustering (and optionally UMAP) on the PCA projections.
-    Called automatically from plot_pca_report when CLUSTER = True.
+    KMeans clustering (+ optional UMAP re-embedding) on *result['projections']*.
+    Single entry point; works for PCA, TICA, and UMAP results.
     """
     if not CLUSTER:
         return
- 
-    proj = pca_result["projections"]   # (n_frames, n_comp)
+    proj    = result["projections"]
+    rep_ids = result.get("replicate_ids")
     os.makedirs(CLUSTER_OUTDIR, exist_ok=True)
+    print(f"\n🔵  Clustering ({method_label}) …")
  
-    methods = {"PCA": proj}
+    embeddings = {method_label: proj}
     if CLUSTER_USE_UMAP:
         try:
             import umap as _umap
-            print("   🔵  Running UMAP …")
-            methods["UMAP"] = _umap.UMAP(random_state=42).fit_transform(proj)
+            embeddings[f"{method_label}_UMAP"] = (
+                _umap.UMAP(random_state=42).fit_transform(proj))
         except ImportError:
             print("   ⚠️  umap-learn not found — skipping UMAP.  pip install umap-learn")
  
-    print(f"\n🔵  Clustering — {', '.join(methods)} …")
-    for method_name, embedding in methods.items():
-        labels, centers = _kmeans_elbow(embedding, label=method_name)
- 
-        _plot_cluster_embedding(
-            embedding2d = embedding[:, :2],
-            labels      = labels,
-            centers2d   = centers[:, :2],
-            method      = method_name,
-            label       = method_name,
-        )
- 
-        # save frame-level CSV
-        csv_path = os.path.join(CLUSTER_OUTDIR, f"cluster_labels_{method_name}.csv")
-        np.savetxt(csv_path,
-                   np.column_stack([np.arange(len(labels)), labels]),
+    for emb_label, emb in embeddings.items():
+        labels, centers = _kmeans_elbow(emb, emb_label)
+        _plot_cluster_embedding(emb[:, :2], labels, centers[:, :2],
+                                title=f"Clusters — {emb_label}",
+                                fname=f"clusters_{emb_label}.png")
+        csv_path = os.path.join(CLUSTER_OUTDIR, f"labels_{emb_label}.csv")
+        np.savetxt(csv_path, np.column_stack([np.arange(len(labels)), labels]),
                    delimiter=",", header="frame,cluster", comments="", fmt="%d")
-        print(f"   🗂️  Labels saved → {csv_path}")
- 
+        print(f"   🗂️  Labels → {csv_path}")
         if CLUSTER_EXTRACT_CENTROIDS:
-            _extract_centroids(system, embedding, labels, centers, label=method_name)
-
+            _extract_centroids(systems, emb, labels, centers, rep_ids, emb_label)
+ 
 # =============================================================================
-# 📊  REPORT FIGURE  (2 × 2 layout)
+# 📊  REPORT FIGURE  — unified 4-panel layout for PCA / TICA / UMAP
 # =============================================================================
-
-def plot_pca_report(obj_name,
-                    selection = PCA_SEL_ACTIVE,
-                    n_components = PCA_NCOMP,
-                    n_bins     = PCA_NBINS,
-                    sigma      = PCA_SIGMA,
-                    temperature = PCA_TEMP,
-                    output     = OUTPUT_PNG):
-    """
-    Full PCA / FEL report saved to *output*.
-
-    Panel layout:
-      Top-left    – Free-Energy Landscape (PC1 vs PC2)
-      Top-right   – Residue cross-correlation matrix
-      Bottom-left – Explained-variance bar chart (first 10 PCs)
-      Bottom-right – PC1 & PC2 projection histograms + KDE
-    """
-    from scipy.stats import gaussian_kde
-    from matplotlib.gridspec import GridSpec
-
-    print(f"\n💠  Essential Dynamics Analysis — '{obj_name}'")
-
-    pca = compute_pca(obj_name, selection, n_components)
-    if pca is None:
-        return None
-    
-    if CLUSTER:
-        run_clustering(pca, obj_name)
-    if EXPORT_CSV:
-        evr = pca["explained_variance_ratio"]
-        cumvar = pca["cumulative_variance"]
-        n_used = pca["n_components"]
-    
-        np.savetxt(OUTPUT_EVR_CSV, np.column_stack((np.arange(1, len(evr)+1), evr, cumvar)), delimiter=",",
-                   header="PC,explained_variance_ratio,cumulative_variance",
-                   comments=""
-                  )
-        loadings = np.column_stack((np.arange(1, n_used + 1)[:,None], pca["eigenvectors"][:n_used]))
-        
-        np.savetxt(OUTPUT_LOADINGS_CSV, loadings, delimiter=",", 
-                   header="PC," + ",".join(f"feature_{i+1}" for i in range(pca["eigenvectors"].shape[1])),
-                   comments=""
-                  )
-
-    fel = compute_fel(pca, temperature, n_bins, sigma)
-
-    evr     = pca["explained_variance_ratio"]
-    nc      = pca["n_components"]
-    F       = fel["F"]
-    xc, yc  = fel["xcenters"], fel["ycenters"]
-    pc1, pc2 = fel["pc1"], fel["pc2"]
-
-    # ── Figure skeleton ───────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(16, 14))
-    fig.suptitle("Essential Dynamics  —  PCA Report",
-                 fontsize=15, fontweight="bold")
-
-    gs = GridSpec(2, 2, figure=fig,
-                  hspace=0.32, wspace=0.35,
-                  top=0.94, bottom=0.06, left=0.07, right=0.97)
-
-    ax_fel = fig.add_subplot(gs[0, 0])
-    ax_cc  = fig.add_subplot(gs[0, 1])
-    ax_bar = fig.add_subplot(gs[1, 0])
-    ax_kde = fig.add_subplot(gs[1, 1])
-
-    # ── Panel 1: Free-Energy Landscape ───────────────────────────────────────
+ 
+def _panel_fel(ax, fig, fel, result, method):
+    """Panel 1: Free-Energy Landscape (identical for all methods)."""
+    comp_label = result.get("comp_label", "Dim")
+    evr        = result.get("explained_variance_ratio")
+    F    = fel["F"]
+    x, y = fel["x"], fel["y"]
+ 
     F_plot = np.where(np.isnan(F), np.nanmax(F), F)
-    XX, YY = np.meshgrid(xc, yc)
+    XX, YY = np.meshgrid(fel["xcenters"], fel["ycenters"])
     levels = np.linspace(0, np.nanpercentile(F, 97), 30)
-
-    cf = ax_fel.contourf(XX, YY, F_plot.T, levels=levels,
-                         cmap="RdYlBu_r", extend="max")
-    ax_fel.contour(XX, YY, F_plot.T, levels=levels[::5],
-                   colors="k", linewidths=0.4, alpha=0.5)
-
-    cbar = fig.colorbar(cf, ax=ax_fel, fraction=0.046, pad=0.04)
-    cbar.set_label("Free Energy (kJ mol⁻¹)", fontsize=10)
-    F_max  = np.nanpercentile(F, 97)
-    _step  = max(1, int(round(F_max / 6)))
-    cbar.set_ticks(range(0, int(F_max) + _step, _step))
-
-    ax_fel.plot(pc1, pc2, color="white", lw=0.25, alpha=0.3, rasterized=True)
-    ax_fel.scatter(pc1[0],  pc2[0],  c="lime", s=130, marker="*",
-                   zorder=5, edgecolors="k", lw=0.7, label="Start")
-    ax_fel.scatter(pc1[-1], pc2[-1], c="red",  s=130, marker="*",
-                   zorder=5, edgecolors="k", lw=0.7, label="End")
-
-    ax_fel.set_xlabel(f"PC1 ({evr[0]*100:.1f}%)", fontsize=11, fontweight="bold")
-    ax_fel.set_ylabel(f"PC2 ({evr[1]*100:.1f}%)", fontsize=11, fontweight="bold")
-    ax_fel.set_title(f"Free-Energy Landscape  (T = {temperature:.0f} K)",
+ 
+    cf = ax.contourf(XX, YY, F_plot.T, levels=levels, cmap="RdYlBu_r", extend="max")
+    ax.contour(XX, YY, F_plot.T, levels=levels[::5],
+               colors="k", linewidths=0.4, alpha=0.5)
+    cb = fig.colorbar(cf, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_label("Free Energy (kJ mol⁻¹)", fontsize=10)
+    F_max = np.nanpercentile(F, 97)
+    cb.set_ticks(range(0, int(F_max) + max(1, int(round(F_max/6))),
+                       max(1, int(round(F_max/6)))))
+ 
+    ax.plot(x, y, color="white", lw=0.25, alpha=0.3, rasterized=True)
+    ax.scatter(x[0],  y[0],  c="lime", s=130, marker="*",
+               zorder=5, edgecolors="k", lw=0.7, label="Start")
+    ax.scatter(x[-1], y[-1], c="red",  s=130, marker="*",
+               zorder=5, edgecolors="k", lw=0.7, label="End")
+ 
+    xlabel = f"{comp_label}1 ({evr[0]*100:.1f}%)" if evr is not None else f"{comp_label}1"
+    ylabel = f"{comp_label}2 ({evr[1]*100:.1f}%)" if evr is not None else f"{comp_label}2"
+    ax.set_xlabel(xlabel, fontsize=11, fontweight="bold")
+    ax.set_ylabel(ylabel, fontsize=11, fontweight="bold")
+    ax.set_title(f"Free-Energy Landscape  ({method.upper()}, T={PCA_TEMP:.0f} K)",
+                 fontsize=12, fontweight="bold")
+    ax.set_xlim(fel["xedges"][0], fel["xedges"][-1])
+    ax.set_ylim(fel["yedges"][0], fel["yedges"][-1])
+    ax.legend(fontsize=10, loc="upper right", frameon=True)
+    ax.grid(True, color="white", alpha=0.15, ls="--", lw=0.5)
+ 
+ 
+def _panel_corr_or_time(ax, fig, result, method):
+    """
+    Panel 2 (top-right):
+      PCA / TICA → residue cross-correlation matrix
+      UMAP       → trajectory-progression scatter (time-coloured)
+    """
+    if "cross_correlation" in result:
+        cc = result["cross_correlation"]
+        im = ax.imshow(cc, cmap="RdBu_r", vmin=-1, vmax=1,
+                       aspect="auto", origin="lower", interpolation="nearest")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Cross-correlation")
+        ax.set_xlabel("Residue index", fontsize=11, fontweight="bold")
+        ax.set_ylabel("Residue index", fontsize=11, fontweight="bold")
+        ax.set_title("Residue Cross-Correlation Matrix",
                      fontsize=12, fontweight="bold")
-    ax_fel.set_xlim(fel["xedges"][0], fel["xedges"][-1])
-    ax_fel.set_ylim(fel["yedges"][0], fel["yedges"][-1])
-    ax_fel.legend(fontsize=10, loc="upper right", frameon=True)
-    ax_fel.grid(True, color="white", alpha=0.15, linestyle="--", linewidth=0.5)
-
-    # ── Panel 2: Cross-Correlation Matrix ────────────────────────────────────
-    cc = pca["cross_correlation"]
-    im = ax_cc.imshow(cc, cmap="RdBu_r", vmin=-1, vmax=1,
-                      aspect="auto", origin="lower", interpolation="nearest")
-    fig.colorbar(im, ax=ax_cc, fraction=0.046, pad=0.04,
-                 label="Cross-correlation")
-    ax_cc.set_xlabel("Residue index", fontsize=11, fontweight="bold")
-    ax_cc.set_ylabel("Residue index", fontsize=11, fontweight="bold")
-    ax_cc.set_title("Residue Cross-Correlation Matrix",
-                    fontsize=12, fontweight="bold")
-
-    # ── Panel 3: Explained-Variance Bar Chart ────────────────────────────────
+    else:
+        # UMAP: colour by frame number to show trajectory sampling
+        proj = result["projections"]
+        sc = ax.scatter(proj[:, 0], proj[:, 1], c=np.arange(len(proj)),
+                        cmap="viridis", s=15, alpha=0.75, rasterized=True)
+        fig.colorbar(sc, ax=ax, label="Frame index")
+        ax.set_xlabel("Dim 1", fontsize=11, fontweight="bold")
+        ax.set_ylabel("Dim 2", fontsize=11, fontweight="bold")
+        ax.set_title("UMAP — Trajectory Progression",
+                     fontsize=12, fontweight="bold")
+        ax.grid(True, color="lightgray", alpha=0.5, ls="--")
+ 
+ 
+def _panel_variance_or_timescales(ax, result):
+    """
+    Panel 3 (bottom-left):
+      PCA  → explained-variance bar chart
+      TICA → implied timescales bar chart
+      UMAP → text note (non-linear, no EVR)
+    """
+    nc      = result["n_components"]
     n_show  = min(nc, 10)
-    x_ticks = range(1, n_show + 1)
-
-    bars = ax_bar.bar(x_ticks, evr[:n_show] * 100,
-                      color="steelblue", alpha=0.85,
-                      edgecolor="navy", linewidth=0.6)
-
-    for bar, pct in zip(bars, evr[:n_show] * 100):
-        ax_bar.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.3,
-                    f"{pct:.1f}%",
-                    ha="center", va="bottom", fontsize=8, fontweight="bold")
-
-    ax2 = ax_bar.twinx()
-    ax2.plot(x_ticks, np.cumsum(evr[:n_show]) * 100,
-             "o--", color="coral", lw=1.8, ms=5, label="Cumulative")
-    ax2.set_ylabel("Cumulative Variance (%)", fontsize=10, color="coral")
-    ax2.tick_params(axis="y", labelcolor="coral")
-    ax2.set_ylim(0, 105)
-    ax2.axhline(80, ls=":", color="gray", alpha=0.6, lw=1.0)
-    ax2.axhline(90, ls=":", color="gray", alpha=0.6, lw=1.0)
-    ax2.legend(loc="center right", fontsize=9)
-
-    ax_bar.set_xlabel("Principal Component", fontsize=11, fontweight="bold")
-    ax_bar.set_ylabel("Explained Variance (%)", fontsize=11, fontweight="bold")
-    ax_bar.set_title(f"First {n_show} PCs — Explained Variance",
+    bar_lbl = result.get("bar_label")
+    evr     = result.get("explained_variance_ratio")
+ 
+    if "timescales" in result:
+        # TICA implied timescales — clip negatives (unphysical; arise from
+        # random/short data where processes are faster than the lag time)
+        ts      = result["timescales"]
+        ts_plot = np.abs(ts[:min(len(ts), n_show)])
+        n_neg   = int((ts[:len(ts_plot)] < 0).sum())
+        x       = range(1, len(ts_plot) + 1)
+        bars    = ax.bar(x, ts_plot, color="teal", alpha=0.85,
+                         edgecolor="darkcyan", lw=0.6)
+        for bar, v in zip(bars, ts_plot):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                    f"{v:.1f}", ha="center", va="bottom", fontsize=8, fontweight="bold")
+        if n_neg:
+            ax.set_title(f"TICA Implied Timescales  (lag={result.get('lag', TICA_LAG)}) "
+                         f"— {n_neg} IC(s) negative (|·| shown)",
+                         fontsize=11, fontweight="bold")
+        else:
+            ax.set_title(f"TICA Implied Timescales  (lag={result.get('lag', TICA_LAG)})",
+                         fontsize=12, fontweight="bold")
+        ax.set_xlabel("IC", fontsize=11, fontweight="bold")
+        ax.set_ylabel(f"Timescale (×{MD_INTERVAL} frames)",
+                      fontsize=10, fontweight="bold")
+        ax.grid(True, axis="y", color="skyblue", alpha=0.4, ls="--")
+        ax.set_axisbelow(True)
+ 
+    elif evr is not None:
+        # PCA explained variance
+        x_ticks = range(1, n_show + 1)
+        bars = ax.bar(x_ticks, evr[:n_show]*100, color="steelblue",
+                      alpha=0.85, edgecolor="navy", lw=0.6)
+        for bar, pct in zip(bars, evr[:n_show]*100):
+            ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.3,
+                    f"{pct:.1f}%", ha="center", va="bottom",
+                    fontsize=8, fontweight="bold")
+        ax2 = ax.twinx()
+        ax2.plot(x_ticks, np.cumsum(evr[:n_show])*100, "o--", color="coral",
+                 lw=1.8, ms=5, label="Cumulative")
+        ax2.set_ylabel("Cumulative (%)", fontsize=10, color="coral")
+        ax2.tick_params(axis="y", labelcolor="coral")
+        ax2.set_ylim(0, 105)
+        for thresh in (80, 90):
+            ax2.axhline(thresh, ls=":", color="gray", alpha=0.6, lw=1.0)
+        ax2.legend(loc="center right", fontsize=9)
+        ax.set_xlabel("Principal Component", fontsize=11, fontweight="bold")
+        ax.set_ylabel(bar_lbl or "Explained Variance (%)", fontsize=11, fontweight="bold")
+        ax.set_title(f"First {n_show} PCs — Explained Variance",
                      fontsize=12, fontweight="bold")
-    ax_bar.set_xticks(list(x_ticks))
-    ax_bar.set_ylim(0, 105)
-    ax_bar.grid(True, axis="y", color="skyblue", alpha=0.4, linestyle="--")
-    ax_bar.set_axisbelow(True)
-
-    # ── Panel 4: PC1 & PC2 Projection Histograms + KDE ───────────────────────
-    for comp, label, color, idx in [(pc1, "PC1", "teal", 0),
-                                    (pc2, "PC2", "darkorange", 1)]:
-        pct = evr[idx] * 100
-        ax_kde.hist(comp, bins=60, color=color, alpha=0.45,
-                    edgecolor="k", linewidth=0.3, density=True, label=f"{label} ({pct:.1f}%)")
+        ax.set_xticks(list(x_ticks))
+        ax.set_ylim(0, 105)
+        ax.grid(True, axis="y", color="skyblue", alpha=0.4, ls="--")
+        ax.set_axisbelow(True)
+ 
+    else:
+        ax.text(0.5, 0.5,
+                "UMAP\nNon-linear projection\n(no explained variance)",
+                ha="center", va="center", fontsize=13, transform=ax.transAxes,
+                bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
+        ax.axis("off")
+ 
+ 
+def _panel_kde(ax, result):
+    """Panel 4: 1-D projection histograms + KDE (identical for all methods)."""
+    proj       = result["projections"]
+    comp_label = result.get("comp_label", "Dim")
+    evr        = result.get("explained_variance_ratio")
+ 
+    for i, (color, name) in enumerate(zip(["teal", "darkorange"],
+                                          [f"{comp_label}1", f"{comp_label}2"])):
+        comp = proj[:, i]
+        pct_str = f" ({evr[i]*100:.1f}%)" if evr is not None else ""
+        ax.hist(comp, bins=60, color=color, alpha=0.45, edgecolor="k",
+                lw=0.3, density=True, label=f"{name}{pct_str}")
         xr = np.linspace(comp.min(), comp.max(), 300)
-        ax_kde.plot(xr, gaussian_kde(comp)(xr), color=color, lw=2.0)
-        ax_kde.axvline(comp.mean(), color=color, ls="--", lw=1.2)
-
-    ax_kde.set_xlabel("Projection value", fontsize=11, fontweight="bold")
-    ax_kde.set_ylabel("Density", fontsize=11, fontweight="bold")
-    ax_kde.set_title("PC1 & PC2 Projection Distributions",
-                     fontsize=12, fontweight="bold")
-    ax_kde.legend(fontsize=9)
-    ax_kde.grid(True, color="lightgray", alpha=0.5, linestyle="--")
-
-    # ── Save ─────────────────────────────────────────────────────────────────
-    plt.savefig(output, dpi=300, bbox_inches="tight")
-    print(f"👑  PCA report saved → {output}")
-    plt.close("all")
-    # ── Open Results ─────────────────────────────────────────────────────────
+        ax.plot(xr, gaussian_kde(comp)(xr), color=color, lw=2.0)
+        ax.axvline(comp.mean(), color=color, ls="--", lw=1.2)
+ 
+    ax.set_xlabel("Projection value", fontsize=11, fontweight="bold")
+    ax.set_ylabel("Density", fontsize=11, fontweight="bold")
+    ax.set_title("Projection Distributions", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(True, color="lightgray", alpha=0.5, ls="--")
+ 
+ 
+def plot_report(result, method, output):
+    """
+    Universal 4-panel report. Works for PCA, TICA, and UMAP.
+    Dispatches each panel based on keys present in *result*.
+    """
+    fel = compute_fel(result)
+    fig = plt.figure(figsize=(16, 14))
+    fig.suptitle(f"Essential Dynamics  —  {method.upper()} Report",
+                 fontsize=15, fontweight="bold")
+    gs = GridSpec(2, 2, figure=fig, hspace=0.32, wspace=0.35,
+                  top=0.94, bottom=0.06, left=0.07, right=0.97)
+ 
+    _panel_fel(fig.add_subplot(gs[0, 0]), fig, fel, result, method)
+    _panel_corr_or_time(fig.add_subplot(gs[0, 1]), fig, result, method)
+    _panel_variance_or_timescales(fig.add_subplot(gs[1, 0]), result)
+    _panel_kde(fig.add_subplot(gs[1, 1]), result)
+ 
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    fig.savefig(output, dpi=300, bbox_inches="tight")
+    print(f"👑  {method.upper()} report saved → {output}")
+    plt.close(fig)
+    _open_file(output)
+ 
+# =============================================================================
+# 🔵  REPLICATE ELLIPSE PLOT
+# =============================================================================
+ 
+def _confidence_ellipse(ax, x, y, color, level=0.95):
+    """Covariance ellipse for 2-D Gaussian data at given confidence level."""
+    chi2_lut = {0.68: 2.279, 0.90: 4.605, 0.95: 5.991, 0.99: 9.210}
+    if len(x) < 3:
+        return
+    cov = np.cov(x, y)
+    if not np.all(np.isfinite(cov)):
+        return
+    vals, vecs = np.linalg.eigh(np.maximum(cov, 0))
+    order = vals.argsort()[::-1]
+    vals, vecs = vals[order], vecs[:, order]
+    angle = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
+    w, h  = 2 * np.sqrt(vals * chi2_lut.get(level, 5.991))
+    ax.add_patch(Ellipse(xy=(x.mean(), y.mean()), width=w, height=h,
+                         angle=angle, facecolor=color, edgecolor=color,
+                         alpha=0.13, lw=1.5))
+ 
+ 
+def plot_replicate_embedding(result, method, output):
+    """
+    Scatter + confidence ellipses coloured by replicate.
+    Requires 'replicate_ids' in *result*. Works for any method.
+    """
+    rep_ids = result.get("replicate_ids")
+    if rep_ids is None:
+        print("ℹ️  No replicate metadata — skipping replicate plot.")
+        return
+    proj    = result["projections"]
+    evr     = result.get("explained_variance_ratio")
+    comp_lbl = result.get("comp_label", "Dim")
+ 
+    fig, ax = plt.subplots(figsize=(8, 7))
+    for i, rep in enumerate(np.unique(rep_ids)):
+        mask  = rep_ids == rep
+        color = _PALETTE[i % len(_PALETTE)]
+        ax.scatter(proj[mask, 0], proj[mask, 1], s=22, alpha=0.65, color=color,
+                   edgecolors="k", lw=0.25, rasterized=True,
+                   label=f"Rep {rep}  (n={mask.sum()})")
+        _confidence_ellipse(ax, proj[mask, 0], proj[mask, 1],
+                            color=color, level=REPLICATE_ELLIPSE_LEVEL)
+ 
+    xlabel = (f"{comp_lbl}1 ({evr[0]*100:.1f}%)" if evr is not None
+              else f"{comp_lbl}1")
+    ylabel = (f"{comp_lbl}2 ({evr[1]*100:.1f}%)" if evr is not None
+              else f"{comp_lbl}2")
+    ax.set_xlabel(xlabel, fontsize=11, fontweight="bold")
+    ax.set_ylabel(ylabel, fontsize=11, fontweight="bold")
+    ax.set_title(f"{method.upper()} — Projection by Replicate  "
+                 f"({REPLICATE_ELLIPSE_LEVEL:.0%} ellipses)",
+                 fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9, frameon=True)
+    ax.grid(True, color="lightgray", alpha=0.45, ls="--")
+    ax.set_axisbelow(True)
+    fig.savefig(output, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"   📊  Replicate plot → {output}")
+ 
+# =============================================================================
+# 🗂️  CSV EXPORT
+# =============================================================================
+ 
+def export_csv(result, method, prefix):
+    """Save variance / timescale and loadings CSVs for the given method."""
+    evr    = result.get("explained_variance_ratio")
+    cumvar = result.get("cumulative_variance")
+    nc     = result["n_components"]
+    ts     = result.get("timescales")
+ 
+    if evr is not None:
+        cols = [np.arange(1, nc+1), evr*100, cumvar*100]
+        hdrs = "component,variance_pct,cumulative_pct"
+        if ts is not None:
+            cols.append(ts); hdrs += ",timescale_frames"
+        np.savetxt(f"{prefix}_{method}_variance.csv",
+                   np.column_stack(cols), delimiter=",",
+                   header=hdrs, comments="",
+                   fmt=["%d"] + ["%.4f"] * (len(cols) - 1))
+ 
+    if "eigenvectors" in result:
+        evecs = result["eigenvectors"][:nc]
+        header = "component," + ",".join(f"feature_{i+1}"
+                                         for i in range(evecs.shape[1]))
+        rows = np.column_stack([np.arange(1, nc+1)[:, None], evecs])
+        np.savetxt(f"{prefix}_{method}_loadings.csv", rows,
+                   delimiter=",", header=header, comments="",
+                   fmt=["%d"] + ["%.6f"]*evecs.shape[1])
+ 
+    print(f"   🗂️  CSV → {prefix}_{method}_variance.csv  "
+          f"(+ _loadings.csv)" if "eigenvectors" in result else "")
+ 
+# =============================================================================
+# 🚀  MAIN PIPELINE
+# =============================================================================
+ 
+def _open_file(path):
+    """Open output file in the default viewer (cross-platform)."""
     time.sleep(0.3)
     if platform.system() == "Darwin":
-        os.system(f"open {output}")
+        os.system(f"open {path}")
     elif platform.system() == "Windows":
-        os.system(f"start {output}")
+        os.system(f"start {path}")
     else:
-        os.system(f"xdg-open {output}")
-
-    return output
-
-# =============================================================================
-# 🚀  MAIN PIPELINE  — runs automatically on drag-and-drop in PyMOL
-# =============================================================================
-
+        os.system(f"xdg-open {path}")
+ 
+ 
+def _run_pipeline(systems, selection, methods, prefix, outdir="."):
+    """
+    Core analysis loop. Called by both main() (PyMOL / auto-discover) and
+    main_cli() (argparse). Accepts single system or list of systems.
+    """
+    if not isinstance(systems, (list, tuple)):
+        systems = [systems]
+ 
+    # ── Extract frames once, reuse for all methods ──────────────────────────
+    print(f"\n📐  Extracting frames  (selection: '{selection}') …")
+    positions, rep_ids = _extract_frames(systems, selection)
+    print(f"   Total: {len(positions)} frames × {positions.shape[1]} features")
+    if len(positions) < 3:
+        print("❌  Not enough frames for analysis."); return
+ 
+    # Split per-replicate for TICA (must not concatenate across boundaries)
+    if rep_ids is not None:
+        frame_arrays = [positions[rep_ids == r] for r in np.unique(rep_ids)]
+    else:
+        frame_arrays = [positions]
+ 
+    # ── Run each requested method ────────────────────────────────────────────
+    for method in methods:
+        print(f"\n💠  {method.upper()} …")
+        result = _reduce(method, positions, frame_arrays)
+        if result is None:
+            continue
+        if rep_ids is not None:
+            result["replicate_ids"] = rep_ids
+ 
+        out_report   = os.path.join(outdir, f"{prefix}_{method.upper()}.png")
+        out_replicates = os.path.join(outdir, f"{prefix}_{method.upper()}_replicates.png")
+ 
+        plot_report(result, method=method, output=out_report)
+ 
+        if REPLICATE_PLOT and rep_ids is not None:
+            plot_replicate_embedding(result, method, output=out_replicates)
+ 
+        if EXPORT_CSV:
+            export_csv(result, method, os.path.join(outdir, prefix))
+ 
+        run_clustering(result, systems, method_label=method.upper())
+ 
+ 
 def main():
-    # start benchmark timer
-    start_all = time.time() # start benchamrk timer
+    """
+    Entry point when run from PyMOL (drag-and-drop) or standalone without args.
+    Auto-discovers topology and trajectory in the current directory.
+    """
+    start = time.time()
     print(f"🔌  Backend: {'PyMOL' if USE_PYMOL else 'MDAnalysis'}")
-    
-    traj = next(
-        (f for ext in ("*.nc", "*.xtc", "*.trr", "*.dcd")
-         for f in glob.glob(ext)),
-        None
-    )
-
+ 
+    traj = next((f for ext in ("*.nc","*.xtc","*.trr","*.dcd")
+                 for f in glob.glob(ext)), None)
+ 
     if USE_PYMOL:
-        all_objects = cmd.get_names("objects")
-        if not all_objects:
-            print("❌  No objects loaded in PyMOL. Load topology + trajectory first.")
-            return
-
-        target = all_objects[0]
+        objs = cmd.get_names("objects")
+        if not objs:
+            print("❌  No objects loaded in PyMOL."); return
+        target = objs[0]
         print(f"✨  Target object: {target}")
-
         if traj:
             print(f"💫  Loading trajectory: {traj}")
             cmd.load_traj(traj, target, interval=MD_INTERVAL)
         else:
-            print("ℹ️   No trajectory file found — using states already in PyMOL.")
+            print("ℹ️  No trajectory file found — using states already in PyMOL.")
+        systems = target
+ 
     else:
         try:
             import MDAnalysis as mda
         except ImportError:
-            print("❌  Neither PyMOL nor MDAnalysis is available.  pip install MDAnalysis")
-            return
-
+            print("❌  MDAnalysis not available.  pip install MDAnalysis"); return
+ 
         top = next(iter(glob.glob("*.pdb")), None)
         if not top:
-            print("❌  No topology (.pdb) file found in this folder.")
-            return
+            print("❌  No .pdb topology found in this folder."); return
         print(f"✨  Topology: {top}")
-
-        if traj:
-            print(f"💫  Loading trajectory: {traj}")
-            target = mda.Universe(top, traj)
+ 
+        if MULTI_TRAJ:
+            trajs = sorted(glob.glob(MULTI_TRAJ_PATTERN))
+            if not trajs:
+                print(f"❌  No files matching '{MULTI_TRAJ_PATTERN}' found."); return
+            print(f"💫  Multi-traj: {trajs}")
+            systems = [mda.Universe(top, t) for t in trajs]
+        elif traj:
+            print(f"💫  Trajectory: {traj}")
+            systems = mda.Universe(top, traj)
         else:
-            print("ℹ️   No trajectory file found — using the topology's single frame.")
-            target = mda.Universe(top)
-
-    plot_pca_report(target)
-
-    # Calculate total time
-    total_elapsed = time.time() - start_all
-    hours, rem = divmod(total_elapsed, 3600)
-    minutes, seconds = divmod(rem, 60)
-    print()  # <--- Prints an empty line
-    print(f"🕰️ Total Execution Time: {int(hours)}h {int(minutes)}m {int(seconds)}s")
-
-# run the workflow in PyMOL
-main()
+            print("ℹ️  No trajectory — using single topology frame.")
+            systems = mda.Universe(top)
+ 
+    _run_pipeline(systems, PCA_SEL_ACTIVE, METHODS, OUTPUT_PREFIX)
+ 
+    elapsed = time.time() - start
+    h, r = divmod(elapsed, 3600); m, s = divmod(r, 60)
+    print(f"\n🕰️  Total: {int(h)}h {int(m)}m {int(s)}s")
+ 
+ 
+def main_cli():
+    """CLI entry point — used when the script is invoked directly (not from PyMOL)."""
+    # Declare globals first so we can override them from CLI args below
+    global PCA_NCOMP, PCA_VAR, PCA_MODE, TICA_LAG, MD_INTERVAL, PCA_TEMP
+    global EXPORT_CSV, CLUSTER, CLUSTER_KMAX, CLUSTER_EXTRACT_CENTROIDS
+    global REPLICATE_ELLIPSE_LEVEL
+ 
+    p = argparse.ArgumentParser(
+        prog="quick_pca.py",
+        description="QuickPCA v2.00 — Essential Dynamics (PCA / TICA / UMAP)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("-t", "--topology",   required=False,
+                   help="Topology file (.pdb). Auto-detected if omitted.")
+    p.add_argument("-r", "--trajectory", nargs="+",
+                   help="Trajectory file(s). Multiple = multi-traj mode.")
+    p.add_argument("-s", "--selection",  default=PCA_SEL_MDA,
+                   help="MDAnalysis atom selection string.")
+    p.add_argument("-m", "--method",     nargs="+",
+                   default=METHODS, choices=["pca","tica","umap"],
+                   metavar="METHOD",
+                   help="Reduction method(s): pca, tica, umap.")
+    p.add_argument("--ncomp",    type=int,   default=PCA_NCOMP,
+                   help="Number of components (count mode).")
+    p.add_argument("--var",      type=float, default=PCA_VAR,
+                   help="Cumulative variance threshold (variance mode).")
+    p.add_argument("--mode",     default=PCA_MODE, choices=["count","variance"],
+                   help="Component-count mode.")
+    p.add_argument("--lag",      type=int,   default=TICA_LAG,
+                   help="TICA lag time (in strided frames).")
+    p.add_argument("--interval", type=int,   default=MD_INTERVAL,
+                   help="Frame stride (every Nth frame).")
+    p.add_argument("--temp",     type=float, default=PCA_TEMP,
+                   help="Temperature (K) for FEL Boltzmann inversion.")
+    p.add_argument("--prefix",   default=OUTPUT_PREFIX,
+                   help="Output filename prefix.")
+    p.add_argument("--outdir",   default=".",
+                   help="Output directory.")
+    p.add_argument("--no-csv",   action="store_true",
+                   help="Skip CSV export.")
+    p.add_argument("--no-cluster", action="store_true",
+                   help="Skip clustering.")
+    p.add_argument("--kmax",     type=int,   default=CLUSTER_KMAX,
+                   help="Max k for KMeans elbow.")
+    p.add_argument("--no-centroids", action="store_true",
+                   help="Skip centroid PDB extraction.")
+    p.add_argument("--ellipse-level", type=float, default=REPLICATE_ELLIPSE_LEVEL,
+                   help="Confidence level for replicate ellipses.")
+ 
+    args = p.parse_args()
+ 
+    # Apply CLI args to globals so all functions pick them up
+    PCA_NCOMP                = args.ncomp
+    PCA_VAR                  = args.var
+    PCA_MODE                 = args.mode
+    TICA_LAG                 = args.lag
+    MD_INTERVAL              = args.interval
+    PCA_TEMP                 = args.temp
+    EXPORT_CSV               = not args.no_csv
+    CLUSTER                  = not args.no_cluster
+    CLUSTER_KMAX             = args.kmax
+    CLUSTER_EXTRACT_CENTROIDS = not args.no_centroids
+    REPLICATE_ELLIPSE_LEVEL  = args.ellipse_level
+ 
+    try:
+        import MDAnalysis as mda
+    except ImportError:
+        print("❌  MDAnalysis not available.  pip install MDAnalysis"); sys.exit(1)
+ 
+    # Topology
+    top = args.topology or next(iter(glob.glob("*.pdb")), None)
+    if not top:
+        print("❌  No topology file found. Use --topology or place a .pdb here.")
+        sys.exit(1)
+ 
+    # Trajectories
+    if args.trajectory:
+        trajs   = args.trajectory
+        systems = [mda.Universe(top, t) for t in trajs] if len(trajs) > 1 \
+                  else mda.Universe(top, trajs[0])
+    else:
+        traj = next((f for ext in ("*.nc","*.xtc","*.trr","*.dcd")
+                     for f in glob.glob(ext)), None)
+        systems = mda.Universe(top, traj) if traj else mda.Universe(top)
+ 
+    os.makedirs(args.outdir, exist_ok=True)
+    start = time.time()
+    print(f"🔌  Backend: MDAnalysis")
+    _run_pipeline(systems, args.selection, args.method, args.prefix, args.outdir)
+    elapsed = time.time() - start
+    h, r = divmod(elapsed, 3600); m, s = divmod(r, 60)
+    print(f"\n🕰️  Total: {int(h)}h {int(m)}m {int(s)}s")
+ 
+ 
+# =============================================================================
+# ENTRYPOINT
+# =============================================================================
+ 
+if __name__ == "__main__":
+    main_cli()        # standalone: python quick_pca.py [options]
+elif USE_PYMOL:
+    main()            # PyMOL drag-and-drop
+# else: imported as module — do nothing
