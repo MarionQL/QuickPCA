@@ -53,7 +53,7 @@
 # =============================================================================
 
 import argparse
-import glob
+import csv
 import os
 import sys
 import time
@@ -98,6 +98,13 @@ PCA_NBINS = 50             # 2-D histogram bins per axis for the FEL
 PCA_SIGMA = 1.0            # Gaussian smoothing sigma, in bins (reduces histogram noise
                             # before the Boltzmann inversion)
 PCA_TEMP  = 300.0          # temperature (K) used in the Boltzmann inversion, F = -kT ln(P)
+TICA_INPUT_SPACE = "coordinates"  # "coordinates" or "pca"
+UMAP_INPUT_SPACE = "pca"           # "coordinates" or "pca"
+RANDOM_SEED = 42
+UMAP_N_COMPONENTS = 2
+UMAP_N_NEIGHBORS = 15
+UMAP_MIN_DIST = 0.1
+UMAP_METRIC = "euclidean"
 
 # --- Trajectory sampling -------------------------------------------------------
 MD_INTERVAL = 1            # use every Nth frame (stride). Increase for very long/dense
@@ -139,8 +146,12 @@ GMM_COVARIANCE_TYPE        = "full"
 GMM_REG_COVAR              = 1e-6
 GMM_BIC_DELTA_STOP         = 300        # GMM model selection: stop adding components once
                                          # the BIC improvement from k to k+1 drops below this
+GMM_N_INIT                 = 5
 HDBSCAN_MIN_CLUSTER_SIZE   = 100
 HDBSCAN_MIN_SAMPLES        = None
+HDBSCAN_METRIC             = "euclidean"
+HDBSCAN_CLUSTER_SELECTION_METHOD = "eom"
+CLUSTER_DIRECTORY_NAME     = "clustering"
 
 # --- Replicate handling (MDAnalysis multi-trajectory) -----------------------------
 REPLICATE_PLOT           = True
@@ -253,24 +264,23 @@ def _validate_selected_atom_order(universes, selection, labels=None):
 #      and rotation rather than internal conformational change.
 # =============================================================================
 
-def _kabsch(mobile, ref_pos, ref_com):
-    """Pure-numpy Kabsch alignment. Fallback if MDAnalysis's C routine is unavailable."""
+def _kabsch_rotation(mobile, ref_pos, ref_com):
+    """Return a NumPy Kabsch rotation matrix for mobile -> reference."""
     H        = (mobile - mobile.mean(0)).T @ (ref_pos - ref_com)
     U, _, Vt = np.linalg.svd(H)
     d        = np.sign(np.linalg.det(Vt.T @ U.T))
-    R        = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
-    return (mobile - mobile.mean(0)) @ R.T + ref_com
+    return Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
 
 
 # Prefer MDAnalysis's compiled rotation_matrix (faster than the numpy SVD above);
 # only fall back to the pure-numpy Kabsch implementation if that import fails.
 try:
     from MDAnalysis.analysis.align import rotation_matrix as _mda_rotmat
-    def _align(mobile, ref_pos, ref_com):
+    def _alignment_rotation(mobile, ref_pos, ref_com):
         R, _ = _mda_rotmat(mobile - mobile.mean(0), ref_pos - ref_com)
-        return (mobile - mobile.mean(0)) @ R.T + ref_com
+        return R
 except ImportError:
-    _align = _kabsch
+    _alignment_rotation = _kabsch_rotation
 
 
 # =============================================================================
@@ -398,7 +408,9 @@ def _extract_frames(
 
             # Align using align_selection, then apply that transform to selection.
             mobile_com = align_coords.mean(0)
-            R, _ = _mda_rotmat(align_coords - mobile_com, ref_pos - ref_com)
+            # Use MDAnalysis's compiled rotation when available and the
+            # equivalent NumPy Kabsch implementation otherwise.
+            R = _alignment_rotation(align_coords, ref_pos, ref_com)
             aligned_coords = (coords - mobile_com) @ R.T + ref_com
 
             out[row] = aligned_coords.ravel()
@@ -451,7 +463,7 @@ def _cross_corr(evecs, weights, n_atoms):
     return np.where(denom > 0, cov / denom, 0.0).astype(np.float32)
 
 
-def reduce_pca(positions, n_components=PCA_NCOMP):
+def reduce_pca(positions, n_components=None):
     """
     PCA on the (n_frames x 3N) Cα coordinate matrix.
 
@@ -462,6 +474,7 @@ def reduce_pca(positions, n_components=PCA_NCOMP):
     """
     from sklearn.decomposition import PCA as _PCA
 
+    n_components = PCA_NCOMP if n_components is None else n_components
     if PCA_MODE == "variance":
         n_comp, solver = PCA_VAR, "full"
     else:
@@ -469,7 +482,7 @@ def reduce_pca(positions, n_components=PCA_NCOMP):
         solver = "randomized"
 
     centered = positions - positions.mean(0)
-    model    = _PCA(n_components=n_comp, svd_solver=solver, random_state=42)
+    model    = _PCA(n_components=n_comp, svd_solver=solver, random_state=RANDOM_SEED)
     proj     = model.fit_transform(centered)
 
     nc     = proj.shape[1]
@@ -487,7 +500,8 @@ def reduce_pca(positions, n_components=PCA_NCOMP):
                 bar_label="Explained Variance (%)", comp_label="PC")
 
 
-def reduce_tica(frame_arrays, lag=None, n_components=PCA_NCOMP):
+def reduce_tica(frame_arrays, lag=None, n_components=None,
+                cartesian_components=None, n_cartesian_atoms=None):
     """
     TICA via deeptime. *frame_arrays* is a list of (n_frames, n_features) arrays
     — one per trajectory — so TICA respects trajectory boundaries (it must not
@@ -500,7 +514,8 @@ def reduce_tica(frame_arrays, lag=None, n_components=PCA_NCOMP):
         print("❌  deeptime not found.  pip install deeptime")
         return None
 
-    lag    = lag or TICA_LAG
+    lag = TICA_LAG if lag is None else lag
+    n_components = PCA_NCOMP if n_components is None else n_components
     stacked = np.vstack(frame_arrays)
     n_feat  = stacked.shape[1]
 
@@ -525,7 +540,14 @@ def reduce_tica(frame_arrays, lag=None, n_components=PCA_NCOMP):
 
     # Right singular vectors: shape (n_features, n_comp) → transpose to (n_comp, n_features)
     evecs  = model.singular_vectors_right[:, :n_comp].T
-    cc     = _cross_corr(evecs, sv2, n_feat // 3)
+    if cartesian_components is not None:
+        # Compose TICA loadings with the upstream PCA loadings so exported
+        # eigenvectors and atom cross-correlation remain in Cartesian space.
+        evecs = evecs @ cartesian_components
+        n_cc_atoms = n_cartesian_atoms
+    else:
+        n_cc_atoms = n_feat // 3
+    cc     = _cross_corr(evecs, sv2, n_cc_atoms)
     ts     = model.timescales(lagtime=lag)[:n_comp]
 
     print(f"   IC1={evr[0]*100:.1f}%  IC2={evr[1]*100:.1f}%  "
@@ -539,7 +561,7 @@ def reduce_tica(frame_arrays, lag=None, n_components=PCA_NCOMP):
                 bar_label="Kinetic Variance (%)", comp_label="IC")
 
 
-def reduce_umap(projections, n_components=2):
+def reduce_umap(projections, n_components=None):
     """UMAP applied to existing projections (PCA or TICA output). No eigenvectors —
     UMAP is a non-linear embedding, so there's no per-residue loading to report."""
     try:
@@ -548,7 +570,14 @@ def reduce_umap(projections, n_components=2):
         print("❌  umap-learn not found.  pip install umap-learn")
         return None
     print("   Running UMAP …")
-    model = _umap.UMAP(n_components=n_components, random_state=42)
+    n_components = n_components or UMAP_N_COMPONENTS
+    model = _umap.UMAP(
+        n_components=n_components,
+        n_neighbors=UMAP_N_NEIGHBORS,
+        min_dist=UMAP_MIN_DIST,
+        metric=UMAP_METRIC,
+        random_state=RANDOM_SEED,
+    )
     emb = model.fit_transform(projections)
     return dict(projections=emb, n_components=n_components,
                 model=model, upstream_projections=projections,
@@ -560,17 +589,40 @@ def _reduce(method, positions, frame_arrays):
     if method == "pca":
         return reduce_pca(positions)
     if method == "tica":
-        return reduce_tica(frame_arrays)
-    if method == "umap":
-        # UMAP runs on top of PCA projections (a cheap, variance-preserving
-        # pre-reduction) rather than raw coordinates. Keep the upstream PCA
-        # model so secondary trajectories can be projected through the same
-        # preprocessing before the UMAP transform.
-        pca_r = reduce_pca(positions)
-        r = reduce_umap(pca_r["projections"]) if pca_r else None
+        if TICA_INPUT_SPACE == "pca":
+            pca_r = reduce_pca(positions)
+            pca_proj = pca_r["projections"]
+            offset = 0
+            pca_frame_arrays = []
+            for frames in frame_arrays:
+                pca_frame_arrays.append(pca_proj[offset:offset + len(frames)])
+                offset += len(frames)
+            r = reduce_tica(
+                pca_frame_arrays,
+                cartesian_components=pca_r["eigenvectors"],
+                n_cartesian_atoms=positions.shape[1] // 3,
+            )
+            if r is not None:
+                r["upstream_model"] = pca_r["model"]
+                r["upstream_fit_mean"] = pca_r["fit_mean"]
+                r["input_space"] = "pca"
+            return r
+        r = reduce_tica(frame_arrays)
         if r is not None:
-            r["upstream_model"] = pca_r.get("model")
-            r["upstream_fit_mean"] = pca_r.get("fit_mean")
+            r["input_space"] = "coordinates"
+        return r
+    if method == "umap":
+        if UMAP_INPUT_SPACE == "pca":
+            pca_r = reduce_pca(positions)
+            r = reduce_umap(pca_r["projections"]) if pca_r else None
+            if r is not None:
+                r["upstream_model"] = pca_r.get("model")
+                r["upstream_fit_mean"] = pca_r.get("fit_mean")
+                r["input_space"] = "pca"
+        else:
+            r = reduce_umap(positions)
+            if r is not None:
+                r["input_space"] = "coordinates"
         return r
     print(f"❌  Unknown method: {method}")
     return None
@@ -591,18 +643,23 @@ def _project_positions(method, result, positions):
     if method == "pca":
         return model.transform(positions - result["fit_mean"])
     if method == "tica":
+        if result.get("input_space") == "pca":
+            upstream = result.get("upstream_model")
+            upstream_mean = result.get("upstream_fit_mean")
+            if upstream is None or upstream_mean is None:
+                raise ValueError("PCA-preprocessed TICA projection requires the upstream PCA model.")
+            positions = upstream.transform(positions - upstream_mean)
         return model.transform(positions)
     if method == "umap":
         if not hasattr(model, "transform"):
             raise ValueError("The installed umap-learn model does not support transform().")
-        # Current UMAP is fit on PCA projections, so secondary coordinates must
-        # first be transformed by the upstream PCA model stored in the result.
-        upstream = result.get("upstream_model")
-        upstream_mean = result.get("upstream_fit_mean")
-        if upstream is None or upstream_mean is None:
-            raise ValueError("UMAP projection requires the stored upstream PCA model.")
-        secondary_pca = upstream.transform(positions - upstream_mean)
-        return model.transform(secondary_pca)
+        if result.get("input_space") == "pca":
+            upstream = result.get("upstream_model")
+            upstream_mean = result.get("upstream_fit_mean")
+            if upstream is None or upstream_mean is None:
+                raise ValueError("PCA-preprocessed UMAP projection requires the upstream PCA model.")
+            positions = upstream.transform(positions - upstream_mean)
+        return model.transform(positions)
 
     raise ValueError(f"Unknown projection method: {method}")
 
@@ -627,8 +684,11 @@ def _attach_projection(result, projected_positions, projected_rep_ids, method, l
 # 🌊  SECTION 5 — FREE-ENERGY LANDSCAPE
 # =============================================================================
 
-def compute_fel(result, temperature=PCA_TEMP, n_bins=PCA_NBINS, sigma=PCA_SIGMA):
+def compute_fel(result, temperature=None, n_bins=None, sigma=None):
     """Boltzmann inversion of PC1/PC2 (or IC1/IC2, Dim1/Dim2) density: F = -kT ln(P)."""
+    temperature = PCA_TEMP if temperature is None else temperature
+    n_bins = PCA_NBINS if n_bins is None else n_bins
+    sigma = PCA_SIGMA if sigma is None else sigma
     kBT  = 0.008314462 * temperature
     proj = result["projections"]
     x, y = proj[:, 0], proj[:, 1]
@@ -667,7 +727,7 @@ def _kmeans_elbow(projections, method_label):
     fitted = []
 
     for k in ks:
-        km = KMeans(n_clusters=k, random_state=42, n_init="auto").fit(projections)
+        km = KMeans(n_clusters=k, random_state=RANDOM_SEED, n_init="auto").fit(projections)
         fitted.append(km)
 
     inertias = np.array([km.inertia_ for km in fitted])
@@ -695,7 +755,7 @@ def _kmeans_elbow(projections, method_label):
                 km.labels_,
                 metric="euclidean",
                 sample_size=sample_size if sample_size < n else None,
-                random_state=42,
+                random_state=RANDOM_SEED,
             )
             silhouette_scores.append(score)
 
@@ -785,8 +845,8 @@ def _gmm_bic(projections, method_label):
             n_components=k,
             covariance_type=GMM_COVARIANCE_TYPE,
             reg_covar=GMM_REG_COVAR,
-            n_init=5,
-            random_state=42,
+            n_init=GMM_N_INIT,
+            random_state=RANDOM_SEED,
         ).fit(projections)
 
         fitted.append(model)
@@ -884,8 +944,8 @@ def _hdbscan_cluster(projections, method_label):
     model = hdbscan.HDBSCAN(
         min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
         min_samples=HDBSCAN_MIN_SAMPLES,
-        metric="euclidean",
-        cluster_selection_method="eom",
+        metric=HDBSCAN_METRIC,
+        cluster_selection_method=HDBSCAN_CLUSTER_SELECTION_METHOD,
         prediction_data=True,
     )
     raw_labels = model.fit_predict(projections)
@@ -1130,7 +1190,13 @@ def run_clustering(result, systems, method_label):
         try:
             import umap as _umap
             embeddings[f"{method_label}_UMAP"] = (
-                _umap.UMAP(random_state=42).fit_transform(cluster_input))
+                _umap.UMAP(
+                    n_components=UMAP_N_COMPONENTS,
+                    n_neighbors=UMAP_N_NEIGHBORS,
+                    min_dist=UMAP_MIN_DIST,
+                    metric=UMAP_METRIC,
+                    random_state=RANDOM_SEED,
+                ).fit_transform(cluster_input))
         except ImportError:
             print("   ⚠️  umap-learn not found — skipping UMAP.  pip install umap-learn")
 
@@ -1140,8 +1206,31 @@ def run_clustering(result, systems, method_label):
                                 title=f"Clusters — {emb_label}",
                                 fname=f"clusters_{emb_label}.png")
         csv_path = os.path.join(CLUSTER_OUTDIR, f"labels_{emb_label}.csv")
-        np.savetxt(csv_path, np.column_stack([np.arange(len(labels)), labels]),
-                   delimiter=",", header="frame,cluster", comments="", fmt="%d")
+        frame_indices = result.get("frame_indices")
+        if frame_indices is None:
+            raise ValueError("frame_indices missing; cannot export traceable cluster labels.")
+        metadata = result.get("trajectory_metadata") or []
+        export_rep_ids = rep_ids if rep_ids is not None else np.ones(len(labels), dtype=int)
+        with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([
+                "dataset_row", "replicate", "original_frame", "trajectory_label",
+                "topology", "trajectory", "cluster",
+            ])
+            for row_idx, (rep, original_frame, cluster_label) in enumerate(
+                zip(export_rep_ids, frame_indices, labels)
+            ):
+                rep = int(rep)
+                item = metadata[rep - 1] if rep - 1 < len(metadata) else {}
+                writer.writerow([
+                    row_idx,
+                    rep,
+                    int(original_frame),
+                    item.get("label", f"Trajectory {rep}"),
+                    item.get("topology", ""),
+                    item.get("trajectory", ""),
+                    int(cluster_label),
+                ])
         print(f"   🗂️  Labels → {csv_path}")
         clustering_results[emb_label] = {
             "embedding": emb,
@@ -1153,8 +1242,6 @@ def run_clustering(result, systems, method_label):
         }
 
         if CLUSTER_EXTRACT_CENTROIDS:
-            frame_indices = result.get("frame_indices")
-
             _extract_centroids(
                 systems,
                 emb,
@@ -1860,7 +1947,7 @@ def _run_pipeline(
 
         # Run clustering before report so cluster panels can be included
         if CLUSTER:
-            CLUSTER_OUTDIR = os.path.join(outdir, "clustering", method.lower())
+            CLUSTER_OUTDIR = os.path.join(outdir, CLUSTER_DIRECTORY_NAME, method.lower())
             result["clustering"] = run_clustering(
                 result, systems, method_label=method.upper()
             )
@@ -1928,10 +2015,23 @@ def _config_defaults(cfg):
         "var": _nested_get(cfg, "analysis.variance_threshold", PCA_VAR),
         "mode": _nested_get(cfg, "analysis.component_mode", PCA_MODE),
         "lag": _nested_get(cfg, "analysis.tica_lag", TICA_LAG),
+        "tica_input_space": _nested_get(cfg, "analysis.input_space.tica", TICA_INPUT_SPACE),
+        "umap_input_space": _nested_get(cfg, "analysis.input_space.umap", UMAP_INPUT_SPACE),
+        "random_seed": _nested_get(cfg, "analysis.random_seed", RANDOM_SEED),
+        "umap_n_components": _nested_get(cfg, "analysis.umap.n_components", UMAP_N_COMPONENTS),
+        "umap_n_neighbors": _nested_get(cfg, "analysis.umap.n_neighbors", UMAP_N_NEIGHBORS),
+        "umap_min_dist": _nested_get(cfg, "analysis.umap.min_dist", UMAP_MIN_DIST),
+        "umap_metric": _nested_get(cfg, "analysis.umap.metric", UMAP_METRIC),
         "interval": _nested_get(cfg, "analysis.frame_stride", MD_INTERVAL),
         "temp": _nested_get(cfg, "analysis.temperature", PCA_TEMP),
+        "fel_bins": _nested_get(cfg, "free_energy.bins", PCA_NBINS),
+        "fel_sigma": _nested_get(cfg, "free_energy.smoothing_sigma", PCA_SIGMA),
         "prefix": _nested_get(cfg, "output.prefix", OUTPUT_PREFIX),
         "outdir": _nested_get(cfg, "output.directory", "."),
+        "cluster_directory": _nested_get(
+            cfg, "output.clustering_directory", CLUSTER_DIRECTORY_NAME
+        ),
+        "palette": _nested_get(cfg, "plotting.palette", _PALETTE),
         "report_columns": _nested_get(cfg, "output.report_columns", REPORT_COLUMNS),
         "no_individual_panels": not _nested_get(
             cfg, "output.save_individual_panels", SAVE_INDIVIDUAL_PANELS
@@ -1940,6 +2040,9 @@ def _config_defaults(cfg):
         "no_cluster": not _nested_get(cfg, "clustering.enabled", CLUSTER),
         "cluster_method": _nested_get(cfg, "clustering.method", CLUSTER_METHOD),
         "kmax": _nested_get(cfg, "clustering.kmax", CLUSTER_KMAX),
+        "cluster_inertia_threshold": _nested_get(
+            cfg, "clustering.kmeans.inertia_threshold", CLUSTER_INERTIA_THRESHOLD
+        ),
         "cluster_variance_threshold": _nested_get(
             cfg, "clustering.variance_threshold", CLUSTER_VARIANCE_THRESHOLD
         ),
@@ -1952,11 +2055,19 @@ def _config_defaults(cfg):
         "gmm_bic_delta_stop": _nested_get(
             cfg, "clustering.gmm.bic_delta_stop", GMM_BIC_DELTA_STOP,
         ),
+        "gmm_n_init": _nested_get(cfg, "clustering.gmm.n_init", GMM_N_INIT),
         "hdbscan_min_cluster_size": _nested_get(
             cfg, "clustering.hdbscan.min_cluster_size", HDBSCAN_MIN_CLUSTER_SIZE
         ),
         "hdbscan_min_samples": _nested_get(
             cfg, "clustering.hdbscan.min_samples", HDBSCAN_MIN_SAMPLES
+        ),
+        "hdbscan_metric": _nested_get(
+            cfg, "clustering.hdbscan.metric", HDBSCAN_METRIC
+        ),
+        "hdbscan_selection_method": _nested_get(
+            cfg, "clustering.hdbscan.cluster_selection_method",
+            HDBSCAN_CLUSTER_SELECTION_METHOD,
         ),
         "silhouette": _nested_get(
             cfg, "clustering.compute_silhouette", CLUSTER_SILHOUETTE
@@ -2028,10 +2139,21 @@ def _build_parser(defaults):
     p.add_argument("--var", type=float)
     p.add_argument("--mode", choices=["count", "variance"])
     p.add_argument("--lag", type=int)
+    p.add_argument("--tica-input-space", choices=["coordinates", "pca"])
+    p.add_argument("--umap-input-space", choices=["coordinates", "pca"])
+    p.add_argument("--random-seed", type=int)
+    p.add_argument("--umap-n-components", type=int)
+    p.add_argument("--umap-n-neighbors", type=int)
+    p.add_argument("--umap-min-dist", type=float)
+    p.add_argument("--umap-metric")
     p.add_argument("--interval", type=int)
     p.add_argument("--temp", type=float)
+    p.add_argument("--fel-bins", type=int)
+    p.add_argument("--fel-sigma", type=float)
     p.add_argument("--prefix")
     p.add_argument("--outdir")
+    p.add_argument("--cluster-directory")
+    p.add_argument("--palette", nargs="+")
     p.add_argument("--report-columns", type=int,
                    help="Number of subplot columns in the combined report.")
     p.add_argument("--no-individual-panels", action="store_true")
@@ -2039,6 +2161,7 @@ def _build_parser(defaults):
     p.add_argument("--no-cluster", action="store_true")
     p.add_argument("--cluster-method", choices=["kmeans", "gmm", "hdbscan"])
     p.add_argument("--kmax", type=int)
+    p.add_argument("--cluster-inertia-threshold", type=float)
     p.add_argument(
         "--cluster-variance-threshold", type=float,
         help="Use the smallest leading component set reaching this cumulative variance fraction.",
@@ -2046,8 +2169,13 @@ def _build_parser(defaults):
     p.add_argument("--gmm-covariance-type", choices=["full", "tied", "diag", "spherical"])
     p.add_argument("--gmm-reg-covar", type=float)
     p.add_argument("--gmm-bic-delta-stop", type=float)
+    p.add_argument("--gmm-n-init", type=int)
     p.add_argument("--hdbscan-min-cluster-size", type=int)
     p.add_argument("--hdbscan-min-samples", type=int)
+    p.add_argument("--hdbscan-metric")
+    p.add_argument(
+        "--hdbscan-selection-method", choices=["eom", "leaf"]
+    )
     p.add_argument("--silhouette", action="store_true")
     p.add_argument("--silhouette-sample", type=int)
     p.add_argument("--cluster-select-by", choices=["elbow", "silhouette"])
@@ -2069,14 +2197,18 @@ def _build_parser(defaults):
 def main_cli():
     """Standalone MDAnalysis entry point with YAML plus optional CLI overrides."""
     global PCA_NCOMP, PCA_VAR, PCA_MODE, TICA_LAG, MD_INTERVAL, PCA_TEMP
+    global PCA_NBINS, PCA_SIGMA, TICA_INPUT_SPACE, UMAP_INPUT_SPACE, RANDOM_SEED
+    global UMAP_N_COMPONENTS, UMAP_N_NEIGHBORS, UMAP_MIN_DIST, UMAP_METRIC
     global EXPORT_CSV, CLUSTER, CLUSTER_KMAX, CLUSTER_VARIANCE_THRESHOLD
     global CLUSTER_EXTRACT_CENTROIDS, CLUSTER_CENTROID_LIGAND_SELECTION
     global CLUSTER_SILHOUETTE, CLUSTER_SILHOUETTE_SAMPLE, CLUSTER_SELECT_BY
     global CLUSTER_METHOD, GMM_COVARIANCE_TYPE, GMM_REG_COVAR
-    global GMM_BIC_DELTA_STOP
-    global HDBSCAN_MIN_CLUSTER_SIZE, HDBSCAN_MIN_SAMPLES
+    global GMM_BIC_DELTA_STOP, GMM_N_INIT, CLUSTER_INERTIA_THRESHOLD
+    global HDBSCAN_MIN_CLUSTER_SIZE, HDBSCAN_MIN_SAMPLES, HDBSCAN_METRIC
+    global HDBSCAN_CLUSTER_SELECTION_METHOD, CLUSTER_DIRECTORY_NAME
     global CLUSTER_USE_UMAP, REPLICATE_ELLIPSE_LEVEL, PROJECT_PLOT
     global REPLICATE_PLOT, REPORT_COLUMNS, SAVE_INDIVIDUAL_PANELS
+    global _PALETTE
 
     config_probe = argparse.ArgumentParser(add_help=False)
     config_probe.add_argument("--config")
@@ -2090,20 +2222,34 @@ def main_cli():
     PCA_VAR = args.var
     PCA_MODE = args.mode
     TICA_LAG = args.lag
+    TICA_INPUT_SPACE = args.tica_input_space
+    UMAP_INPUT_SPACE = args.umap_input_space
+    RANDOM_SEED = args.random_seed
+    UMAP_N_COMPONENTS = args.umap_n_components
+    UMAP_N_NEIGHBORS = args.umap_n_neighbors
+    UMAP_MIN_DIST = args.umap_min_dist
+    UMAP_METRIC = args.umap_metric
     MD_INTERVAL = args.interval
     PCA_TEMP = args.temp
+    PCA_NBINS = args.fel_bins
+    PCA_SIGMA = args.fel_sigma
     EXPORT_CSV = not args.no_csv
     CLUSTER = not args.no_cluster
     CLUSTER_METHOD = args.cluster_method
     CLUSTER_KMAX = args.kmax
+    CLUSTER_INERTIA_THRESHOLD = args.cluster_inertia_threshold
     CLUSTER_VARIANCE_THRESHOLD = args.cluster_variance_threshold
     if not 0.0 < CLUSTER_VARIANCE_THRESHOLD <= 1.0:
         parser.error("--cluster-variance-threshold must be > 0 and <= 1.")
     GMM_COVARIANCE_TYPE = args.gmm_covariance_type
     GMM_REG_COVAR = args.gmm_reg_covar
     GMM_BIC_DELTA_STOP = args.gmm_bic_delta_stop
+    GMM_N_INIT = args.gmm_n_init
     HDBSCAN_MIN_CLUSTER_SIZE = args.hdbscan_min_cluster_size
     HDBSCAN_MIN_SAMPLES = args.hdbscan_min_samples
+    HDBSCAN_METRIC = args.hdbscan_metric
+    HDBSCAN_CLUSTER_SELECTION_METHOD = args.hdbscan_selection_method
+    CLUSTER_DIRECTORY_NAME = args.cluster_directory
     CLUSTER_SILHOUETTE = args.silhouette
     CLUSTER_SILHOUETTE_SAMPLE = max(100, args.silhouette_sample)
     CLUSTER_SELECT_BY = args.cluster_select_by
@@ -2115,6 +2261,26 @@ def main_cli():
     PROJECT_PLOT = not args.no_project_plot
     REPORT_COLUMNS = max(1, args.report_columns)
     SAVE_INDIVIDUAL_PANELS = not args.no_individual_panels
+    _PALETTE = list(args.palette)
+
+    if PCA_NBINS < 2:
+        parser.error("--fel-bins must be at least 2.")
+    if PCA_SIGMA < 0:
+        parser.error("--fel-sigma must be non-negative.")
+    if not 0.0 < CLUSTER_INERTIA_THRESHOLD < 1.0:
+        parser.error("--cluster-inertia-threshold must be between 0 and 1.")
+    if UMAP_N_COMPONENTS < 2 or UMAP_N_NEIGHBORS < 2 or UMAP_MIN_DIST < 0:
+        parser.error("UMAP requires n_components >= 2, n_neighbors >= 2, and min_dist >= 0.")
+    if GMM_N_INIT < 1:
+        parser.error("--gmm-n-init must be at least 1.")
+    if TICA_INPUT_SPACE not in {"coordinates", "pca"}:
+        parser.error("analysis.input_space.tica must be 'coordinates' or 'pca'.")
+    if UMAP_INPUT_SPACE not in {"coordinates", "pca"}:
+        parser.error("analysis.input_space.umap must be 'coordinates' or 'pca'.")
+    if not _PALETTE:
+        parser.error("plotting.palette must contain at least one color.")
+    if not CLUSTER_DIRECTORY_NAME or os.path.isabs(CLUSTER_DIRECTORY_NAME):
+        parser.error("--cluster-directory must be a non-empty relative directory name.")
 
     try:
         import MDAnalysis as mda
@@ -2122,41 +2288,27 @@ def main_cli():
         print("❌  MDAnalysis not available. pip install MDAnalysis")
         sys.exit(1)
 
-    trajectory_metadata = None
-    if args.trajectory:
-        trajs = list(args.trajectory)
-        if args.topology is None:
-            auto_top = next(iter(glob.glob("*.pdb")), None)
-            if not auto_top:
-                parser.error("No topology found. Set input.topologies or --topology.")
-            topologies = [auto_top] * len(trajs)
-        else:
-            topologies = _expand_topologies(args.topology, trajs)
+    if not args.topology:
+        parser.error("Explicit topology input is required: set input.topologies or --topology.")
+    if not args.trajectory:
+        parser.error("Explicit trajectory input is required: set input.trajectories or --trajectory.")
 
-        labels = _normalise_optional_list(
-            args.trajectory_label, len(trajs), "trajectory-label",
-            lambda i: f"Trajectory {i + 1}",
-        )
-        colors = _normalise_optional_list(
-            args.trajectory_color, len(trajs), "trajectory-color",
-            lambda i: _PALETTE[i % len(_PALETTE)],
-        )
-        systems = [mda.Universe(top, traj) for top, traj in zip(topologies, trajs)]
-        trajectory_metadata = [
-            {"label": label, "color": color,
-             "topology": top, "trajectory": traj}
-            for label, color, top, traj in zip(labels, colors, topologies, trajs)
-        ]
-    else:
-        if args.topology and len(args.topology) > 1:
-            parser.error("Multiple topologies require trajectories.")
-        top = args.topology[0] if args.topology else next(iter(glob.glob("*.pdb")), None)
-        if not top:
-            parser.error("No topology file found.")
-        traj = next((f for ext in ("*.nc", "*.xtc", "*.trr", "*.dcd")
-                     for f in glob.glob(ext)), None)
-        systems = mda.Universe(top, traj) if traj else mda.Universe(top)
-        topologies = [top]
+    trajs = list(args.trajectory)
+    topologies = _expand_topologies(args.topology, trajs)
+    labels = _normalise_optional_list(
+        args.trajectory_label, len(trajs), "trajectory-label",
+        lambda i: f"Trajectory {i + 1}",
+    )
+    colors = _normalise_optional_list(
+        args.trajectory_color, len(trajs), "trajectory-color",
+        lambda i: _PALETTE[i % len(_PALETTE)],
+    )
+    systems = [mda.Universe(top, traj) for top, traj in zip(topologies, trajs)]
+    trajectory_metadata = [
+        {"label": label, "color": color,
+         "topology": top, "trajectory": traj}
+        for label, color, top, traj in zip(labels, colors, topologies, trajs)
+    ]
 
     projected_systems = None
     projected_labels = None
