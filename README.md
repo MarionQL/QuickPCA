@@ -1,6 +1,6 @@
 # 💠 QuickPCA: welcome to the universe of eigenvectors!
 
-# QuickPCA: PCA, TICA, UMAP, clustering, and free-energy landscapes for MD trajectories
+*PCA, TICA, UMAP, clustering, and free-energy landscapes for MD trajectories*
 
 <img 
     src="https://github.com/TheVisualHub/VisualFactory/blob/main/assets/quickPCA_logo.png" 
