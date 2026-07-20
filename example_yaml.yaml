@@ -1,0 +1,260 @@
+# QuickPCA v3.0-yaml — complete configuration example
+#
+# This file includes EVERY YAML key recognized by the supplied script.
+# Replace example paths and selections before running.
+# Paths are resolved relative to the directory where quick_pca.py is launched.
+# Unknown/misspelled keys are silently ignored by the current script.
+
+input:
+  # REQUIRED for a reproducible run.
+  # Supply either one topology shared by every trajectory or exactly one topology
+  # per trajectory. Although the script can auto-find one PDB, do not rely on it.
+  topologies:
+    - /path/to/rep1/topology.tpr
+    - /path/to/rep2/topology.tpr
+    - /path/to/rep3/topology.tpr
+
+  # REQUIRED for a normal MD analysis.
+  # Supported by the script's documented interface: NC, XTC, TRR, and DCD.
+  # The order must correspond to topologies, labels, and colors.
+  trajectories:
+    - /path/to/rep1/trajectory.xtc
+    - /path/to/rep2/trajectory.xtc
+    - /path/to/rep3/trajectory.xtc
+
+  # OPTIONAL. Must contain exactly one label per trajectory when included.
+  # Use informative system/replicate names; otherwise generic labels are generated.
+  labels:
+    - "System A — replicate 1"
+    - "System A — replicate 2"
+    - "System A — replicate 3"
+
+  # OPTIONAL. Must contain exactly one Matplotlib-compatible color per trajectory.
+  # Named colors and hex strings are accepted. Defaults come from the built-in palette.
+  colors:
+    - "#1b9e77"
+    - "#66a61e"
+    - "#a6d854"
+
+  # OPTIONAL; default: "protein and name CA".
+  # MDAnalysis selection used as the PCA/TICA coordinate features. It must select
+  # identical atoms in identical order in every primary and projected system.
+  selection: "protein and name CA"
+
+  # OPTIONAL; default: the value of input.selection.
+  # Use a stable core/domain here when analyzing a larger flexible selection.
+  # It must also match identical atoms/order across all systems.
+  align_selection: "protein and name CA"
+
+analysis:
+  # OPTIONAL; default: [pca]. Include any subset of pca, tica, and umap.
+  # TICA requires deeptime; UMAP requires umap-learn.
+  methods:
+    - pca
+    - tica
+    - umap
+
+  # OPTIONAL. Choose whether TICA and UMAP operate directly on the aligned
+  # Cartesian coordinates or on PCA-reduced coordinates. PCA itself always
+  # operates directly on aligned coordinates.
+  input_space:
+    tica: coordinates  # coordinates or pca; default: coordinates
+    umap: pca          # coordinates or pca; default: pca
+
+  # OPTIONAL; default: 42. Shared by PCA, UMAP, K-means, GMM, and silhouette sampling.
+  random_seed: 42
+
+  # OPTIONAL; used for UMAP and clustering.use_umap.
+  umap:
+    n_components: 2   # At least 2; default: 2
+    n_neighbors: 15   # At least 2; default: 15
+    min_dist: 0.1     # Non-negative; default: 0.1
+    metric: euclidean # Any metric supported by the installed umap-learn version
+
+  # OPTIONAL; choices: count or variance; default: count.
+  # count keeps analysis.n_components. variance retains enough components to
+  # reach analysis.variance_threshold and can be slower/more memory intensive.
+  component_mode: count
+
+  # OPTIONAL; default: 10. Primarily used when component_mode is count.
+  # Must leave at least two components for the standard 2-D plots.
+  n_components: 10
+
+  # OPTIONAL; default: 0.90. Used by component_mode: variance.
+  # This is distinct from clustering.variance_threshold.
+  variance_threshold: 0.90
+
+  # OPTIONAL unless tica is requested; default: 10.
+  # Lag in RETAINED/STRIDED frames, not raw frames or ps/ns.
+  # Effective raw-frame lag = tica_lag * frame_stride.
+  tica_lag: 10
+
+  # OPTIONAL; default: 1. Retain every Nth raw trajectory frame.
+  # Increase to reduce correlated samples, runtime, and memory use.
+  frame_stride: 10
+
+  # OPTIONAL; default: 300.0 K. Used only in FEL Boltzmann inversion.
+  temperature: 300.0
+
+free_energy:
+  # OPTIONAL; default: 50. Histogram bins along each of the first two axes.
+  bins: 50
+
+  # OPTIONAL; default: 1.0. Gaussian smoothing sigma in histogram bins.
+  smoothing_sigma: 1.0
+
+output:
+  # OPTIONAL; default: "Report". Method names are appended automatically.
+  prefix: "system_a"
+
+  # OPTIONAL; default: current directory. Created if it does not exist.
+  directory: "/path/to/output/quick_pca"
+
+  # OPTIONAL; default: clustering. Must be a relative directory name.
+  clustering_directory: "clustering"
+
+  # OPTIONAL; default: 2. Number of columns in the combined report grid.
+  report_columns: 2
+
+  # OPTIONAL; default: true. Also save each combined-report panel separately.
+  save_individual_panels: true
+
+  # OPTIONAL; default: true. Export variance/loadings/projection CSV files.
+  export_csv: true
+
+clustering:
+  # OPTIONAL; default: true. Set false to skip all clustering and centroids.
+  enabled: true
+
+  # OPTIONAL; choices: kmeans, gmm, hdbscan; default: kmeans.
+  # kmeans: compact forced groups; gmm: overlapping Gaussian populations;
+  # hdbscan: density-based groups plus explicit noise.
+  method: kmeans
+
+  # OPTIONAL for kmeans/gmm; ignored by hdbscan; default: 12.
+  # Candidate k values are 2 through kmax inclusive.
+  kmax: 12
+
+  # OPTIONAL; default: 0.80; valid range: >0 to 1.
+  # PCA/TICA clustering uses the smallest leading component set reaching this
+  # cumulative variance, with at least two dimensions when available.
+  variance_threshold: 0.80
+
+  kmeans:
+    # OPTIONAL; only affects method: kmeans; default: 0.15.
+    # Elbow selection stops when the relative inertia improvement falls below this.
+    inertia_threshold: 0.15
+
+  # OPTIONAL; only affects kmeans; default: false.
+  # Enables sampled silhouette scores for candidate k values.
+  compute_silhouette: true
+
+  # OPTIONAL; only affects kmeans when silhouette is enabled; default: 2000.
+  # The script enforces a minimum value of 100.
+  silhouette_sample: 2000
+
+  # OPTIONAL; only affects kmeans; choices: elbow or silhouette; default: silhouette.
+  # If silhouette is selected while compute_silhouette is false, elbow is used.
+  select_by: silhouette
+
+  # OPTIONAL; default: false; requires umap-learn.
+  # IMPORTANT: true triggers a SECOND clustering run on a new UMAP embedding;
+  # it does not merely change how the original clusters are plotted.
+  use_umap: false
+
+  # OPTIONAL; default: true. Writes one representative full-system PDB per cluster.
+  extract_centroids: true
+
+  # OPTIONAL; default: null. Include only for a ligand-containing periodic system
+  # when the saved ligand should be shifted near the protein for visualization.
+  # This helper assumes an orthorhombic box. Omit/null for protein-only analyses.
+  centroid_ligand_selection: "resname LIG and not name H*"
+
+  gmm:
+    # OPTIONAL; only affects method: gmm; default: full.
+    # full is most flexible; tied/diag/spherical reduce parameter count.
+    covariance_type: full
+
+    # OPTIONAL; only affects method: gmm; default: 1.0e-6.
+    # Small diagonal regularization that helps prevent singular covariance fits.
+    reg_covar: 1.0e-6
+
+    # OPTIONAL; only affects method: gmm; default: 300.
+    # Stop at simpler k when BIC improvement to k+1 is below this value.
+    # This custom threshold is scale/data-size dependent; inspect the BIC CSV.
+    bic_delta_stop: 300.0
+
+    # OPTIONAL; only affects method: gmm; default: 5.
+    n_init: 5
+
+  hdbscan:
+    # OPTIONAL; only affects method: hdbscan; default: 100.
+    # Minimum number of frames in a cluster. Scale to dataset size and expected
+    # minimum state population.
+    min_cluster_size: 100
+
+    # OPTIONAL; only affects method: hdbscan; default: null.
+    # Larger values demand denser clusters and label more frames as noise.
+    # null lets the package derive its normal default from min_cluster_size.
+    min_samples: null
+
+    # OPTIONAL; only affects method: hdbscan; default: euclidean.
+    metric: euclidean
+
+    # OPTIONAL; only affects method: hdbscan; choices: eom or leaf; default: eom.
+    cluster_selection_method: eom
+
+plotting:
+  # OPTIONAL. Shared plotting palette; must contain at least one Matplotlib color.
+  palette:
+    - steelblue
+    - coral
+    - teal
+    - darkorange
+    - mediumpurple
+    - seagreen
+    - crimson
+    - goldenrod
+    - slategray
+    - deeppink
+  # OPTIONAL; default: 0.95. Supported cleanly by the current lookup table at
+  # 0.90, 0.95, or 0.99; other values fall back internally to the 0.95 factor.
+  ellipse_level: 0.95
+
+  # OPTIONAL; default: true. Only produces a file for multiple primary trajectories.
+  save_replicate_plot: true
+
+  # OPTIONAL; default: true. Only produces a file when projection groups exist.
+  save_projection_plot: true
+
+contact_filter:
+  # ENTIRE SECTION OPTIONAL. Set ligand to null to disable filtering.
+  # When enabled, the same selections/cutoff are applied to primary and projected data.
+
+  # OPTIONAL; default: null (disabled). MDAnalysis ligand atom selection.
+  ligand: null  # Example: "resname LIG and not name H*"
+
+  # OPTIONAL; used only when ligand is not null; default shown below.
+  protein: "protein and not name H*"
+
+  # OPTIONAL; used only when ligand is not null; default: 4.0 angstrom.
+  # A frame is retained when the median ligand-atom minimum protein distance
+  # is <= this cutoff. This is not an any-atom contact criterion.
+  cutoff: 4.0
+
+projection:
+  # ENTIRE SECTION OPTIONAL. Use [] when no secondary trajectories are projected.
+  # Each group is projected independently onto the model fit from the primary input.
+  groups:
+    - label: "System B projected onto System A"
+
+      # OPTIONAL only when all primary trajectories share one topology; otherwise
+      # REQUIRED. Supply one shared topology or one per projected trajectory.
+      topologies:
+        - /path/to/system_b/shared_topology.tpr
+
+      # REQUIRED for each group. One or more projected trajectory files.
+      trajectories:
+        - /path/to/system_b/rep1/trajectory.xtc
+        - /path/to/system_b/rep2/trajectory.xtc
+        - /path/to/system_b/rep3/trajectory.xtc
