@@ -1,17 +1,11 @@
-# quick_pca.py (ver 2.00)
-# Essential Dynamics Analysis for MD trajectories.
-# Runs inside PyMOL (drag-and-drop) or standalone via MDAnalysis.
-# Supports PCA, TICA, and UMAP on single or multiple trajectories.
-#
-# Author: Gleb Novikov
-# © The Visual Hub 2026
-# For educational use only.
-# If you use QuickPCA in your research, please cite this tool.
-#
 #!/usr/bin/env python3
 # =============================================================================
 # quick_pca.py  —  Essential Dynamics Analysis for MD trajectories (v3.0-yaml)
 # =============================================================================
+#
+# Inspired by:
+# Author: Gleb Novikov
+# © The Visual Hub 2026
 #
 # WHAT THIS DOES
 # ---------------
