@@ -1,4 +1,4 @@
-name: md_pipeline
+name: quickpca
 
 channels:
   - conda-forge
