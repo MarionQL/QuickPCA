@@ -90,21 +90,22 @@ then shifts the minimum to zero. The result is a population-derived apparent fre
 
 ## Installation
 
-Python 3.9+ is recommended. Install the base dependencies:
+Python 3.9 or newer is recommended.
+
+### Conda (recommended)
+
+Create the environment from the provided environment file:
 
 ```bash
-python -m pip install numpy scipy matplotlib scikit-learn MDAnalysis PyYAML
+conda env create -f environment.yml
+conda activate quickpca
 ```
 
-Install only the optional packages needed for requested methods:
+If you need to update the environment after changes:
 
 ```bash
-python -m pip install deeptime      # TICA
-python -m pip install umap-learn    # UMAP or clustering.use_umap
-python -m pip install hdbscan       # HDBSCAN clustering
+conda env update -f environment.yml --prune
 ```
-
-For reproducible distribution, provide a tested `requirements.txt` or environment file with pinned versions. `KMeans(n_init="auto")` requires a reasonably recent scikit-learn release.
 
 ## Input requirements
 
