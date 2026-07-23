@@ -212,7 +212,7 @@ def _expand_topologies(topologies, trajectories, option_name="--topology"):
 def _atom_signature(atomgroup):
     """Topology-independent identity/order signature for a selected atom group."""
     return tuple(
-        (str(atom.resname), int(atom.resid), str(atom.name))
+        (int(atom.resid), str(atom.name))
         for atom in atomgroup
     )
 
